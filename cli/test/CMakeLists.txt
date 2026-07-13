@@ -243,6 +243,19 @@ add_extract_scans_test(ExtractScansMixed "1,3-5" "1;3;4;5")
 # Both ends of the fixture's spectrum list (50 spectra, scan=1..50).
 add_extract_scans_test(ExtractScansFileEnds "1,50" "1;50")
 
+# Non-indexed mzML (no <indexedmzML> wrapper, e.g. Waters exports) with a lossy
+# scheme requested - regression test for GitHub issue #176 (segfault caused by
+# misclassifying non-indexed mzML as an external file, which led to a NULL
+# compression function pointer being invoked).
+add_test(NAME CompressNonIndexedMzMLLossy
+    COMMAND ${CMAKE_COMMAND}
+    -DEXECUTABLE=$<TARGET_FILE:mscompress>
+    "-DARGS=--mz-lossy;delta32"
+    -DINPUT_FILE=${TEST_DATA_DIR}/nonindexed_test.mzML
+    -DTEMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/tmp_nonindexed_mzml_lossy
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test_simple.cmake
+)
+
 # Verbose mode test
 add_test(NAME VerboseOutputTest
     COMMAND ${CMAKE_COMMAND}

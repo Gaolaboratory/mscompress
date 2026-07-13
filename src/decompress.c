@@ -472,6 +472,12 @@ void* decompress_routine(void* args) {
             a_args->enc_fun = db_args->df->encode_source_compression_mz_fun;
             a_args->scale_factor = db_args->df->mz_scale_factor;
 
+            if (db_args->df->target_mz_fun == NULL) {
+               error("decompress_routine: target_mz_fun is NULL, cannot decode mz block.\n");
+               free(a_args);
+               return NULL;
+            }
+
             enc_ret = encode_into_buff(db_args->df->target_mz_fun, a_args,
                                        &decmp_mz_binary, &buff, &buff_cap,
                                        buff_off);
@@ -531,6 +537,12 @@ void* decompress_routine(void* args) {
             a_args->src_format = db_args->df->source_inten_fmt;
             a_args->enc_fun = db_args->df->encode_source_compression_inten_fun;
             a_args->scale_factor = db_args->df->int_scale_factor;
+
+            if (db_args->df->target_inten_fun == NULL) {
+               error("decompress_routine: target_inten_fun is NULL, cannot decode intensity block.\n");
+               free(a_args);
+               return NULL;
+            }
 
             enc_ret = encode_into_buff(db_args->df->target_inten_fun, a_args,
                                        &decmp_inten_binary, &buff, &buff_cap,
