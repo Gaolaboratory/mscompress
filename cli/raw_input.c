@@ -240,11 +240,40 @@ static void source_file_cv(int32_t vendor, const char** acc, const char** name) 
    }
 }
 
+/* sourceFile nativeID-format cvParam per vendor: the psi-ms term whose
+ * definition matches the id syntax the raw2ms reader for that vendor
+ * produces (Thermo: controllerType=.. controllerNumber=.. scan=N, Bruker:
+ * frame=F scan=S, Waters: function=F process=P scan=S, SCIEX: scan=N).
+ * Mirrors raw2ms's own writer; declaring a format the ids do not follow is
+ * worse than the generic term, so the two must stay in step. */
+static void native_id_cv(int32_t vendor, const char** acc, const char** name) {
+   switch (vendor) {
+      case RAW_VENDOR_THERMO:
+         *acc = "MS:1000768", *name = "Thermo nativeID format";
+         break;
+      case RAW_VENDOR_BRUKER_TIMS:
+         *acc = "MS:1002818", *name = "Bruker TDF nativeID format";
+         break;
+      case RAW_VENDOR_WATERS:
+         *acc = "MS:1000769", *name = "Waters nativeID format";
+         break;
+      case RAW_VENDOR_SCIEX:
+      case RAW_VENDOR_SCIEX_T2D:
+         *acc = "MS:1000776", *name = "scan number only nativeID format";
+         break;
+      default:
+         *acc = "MS:1000824", *name = "no nativeID format";
+         break;
+   }
+}
+
 /* === mzML writer ========================================================== */
 
 static int mzml_write_header(sink_t* s, const raw_run_t* run, uint64_t count) {
    const char *src_acc, *src_name;
+   const char *nid_acc, *nid_name;
    source_file_cv(run->vendor, &src_acc, &src_name);
+   native_id_cv(run->vendor, &nid_acc, &nid_name);
 
    char run_id[256];
    make_ncname(run->run_id, run_id, sizeof(run_id));
@@ -291,8 +320,9 @@ static int mzml_write_header(sink_t* s, const raw_run_t* run, uint64_t count) {
    if (sink_printf(
            s,
            "\" location=\"\"><cvParam cvRef=\"MS\" accession=\"%s\" name=\"%s\" "
+           "value=\"\"/><cvParam cvRef=\"MS\" accession=\"%s\" name=\"%s\" "
            "value=\"\"/></sourceFile></sourceFileList></fileDescription>",
-           src_acc, src_name))
+           src_acc, src_name, nid_acc, nid_name))
       return -1;
 
    if (sink_printf(

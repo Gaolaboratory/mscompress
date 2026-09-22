@@ -358,6 +358,41 @@ static void test_metadata_and_escaping(void) {
    free(doc.buf);
 }
 
+/* raw2ms declares the psi-ms nativeID-format term matching the id syntax
+ * each vendor's reader produces; the writer here must declare the same term
+ * (declaring a format the ids do not follow is worse than none). */
+static void test_native_id_format_cvparam_per_vendor(void) {
+   struct { int32_t vendor; const char* cv; } cases[] = {
+      {RAW_VENDOR_THERMO, "accession=\"MS:1000768\" name=\"Thermo nativeID format\""},
+      {RAW_VENDOR_BRUKER_TIMS, "accession=\"MS:1002818\" name=\"Bruker TDF nativeID format\""},
+      {RAW_VENDOR_WATERS, "accession=\"MS:1000769\" name=\"Waters nativeID format\""},
+      {RAW_VENDOR_SCIEX, "accession=\"MS:1000776\" name=\"scan number only nativeID format\""},
+      {RAW_VENDOR_SCIEX_T2D, "accession=\"MS:1000776\" name=\"scan number only nativeID format\""},
+      {RAW_VENDOR_UNKNOWN, "accession=\"MS:1000824\" name=\"no nativeID format\""},
+   };
+   for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+      raw_run_t run;
+      build_run(&run);
+      run.vendor = cases[c].vendor;
+      mzml_buf_t doc;
+      if (raw_write_mzml_mem(&run, 0, &doc) != 0) {
+         fprintf(stderr, "FAIL: vendor %d: raw_write_mzml_mem error\n",
+                 cases[c].vendor);
+         failures++;
+         continue;
+      }
+      CHECK(strstr(doc.buf, cases[c].cv) != NULL,
+            "sourceFile declares the nativeID format for its vendor");
+      /* The cvParam belongs in sourceFile, next to the file-format term. */
+      char* sf = strstr(doc.buf, "<sourceFile ");
+      char* sfe = strstr(doc.buf, "</sourceFile>");
+      char* nid = strstr(doc.buf, cases[c].cv);
+      CHECK(sf != NULL && sfe != NULL && nid != NULL && nid > sf && nid < sfe,
+            "nativeID format cvParam sits inside sourceFile");
+      free(doc.buf);
+   }
+}
+
 static void test_mzml_is_well_formed_xml(void) {
    mzml_buf_t doc;
    if (write_doc(&doc))
@@ -615,6 +650,7 @@ int main(void) {
    RUN_TEST(test_empty_spectrum_has_zero_length_binaries);
    RUN_TEST(test_base64_arrays_roundtrip);
    RUN_TEST(test_metadata_and_escaping);
+   RUN_TEST(test_native_id_format_cvparam_per_vendor);
    RUN_TEST(test_mzml_is_well_formed_xml);
    RUN_TEST(test_fd_writer_matches_memory_writer);
    RUN_TEST(test_generated_mzml_compresses_via_pipeline);
