@@ -1281,10 +1281,17 @@ int idxout_finish(idxout_t* io) {
    size_t i;
 
    if (io->wrap) {
+      uint64_t index_list_off;
+
       /* Keep the index block on its own line; a newline inserted here is
        * within the checksum span, so it is hashed like the rest. */
       if (io->written > 0 && !io->last_nl)
          rv |= idxout_emit(io, "\n", 1, 1);
+
+      /* Where <indexList begins: reported in <indexListOffset> so consumers
+       * can find the index from EOF. Recorded before the emit, hence exactly
+       * the '<' position. */
+      index_list_off = io->written;
 
       rv |= idxout_emit(io,
                         "<indexList count=\"1\"><index name=\"spectrum\">\n",
@@ -1320,7 +1327,7 @@ int idxout_finish(idxout_t* io) {
       if (rv == 0) {
          uint8_t digest[20];
          char hex[41];
-         char tail[41 + 64];
+         char tail[41 + 128];
          int n;
          static const char digits[] = "0123456789abcdef";
 
@@ -1331,10 +1338,12 @@ int idxout_finish(idxout_t* io) {
          }
          hex[40] = '\0';
 
-         /* The checksum element itself is outside the span it covers. */
+         /* <indexListOffset> and the checksum element itself are outside
+          * the span the checksum covers (<indexedmzML .. </indexList>). */
          n = snprintf(tail, sizeof(tail),
-                      "\n<fileChecksum>%s</fileChecksum></indexedmzML>\n",
-                      hex);
+                      "\n<indexListOffset>%llu</indexListOffset>"
+                      "<fileChecksum>%s</fileChecksum></indexedmzML>\n",
+                      (unsigned long long)index_list_off, hex);
          if (n > 0 && (size_t)n < sizeof(tail))
             rv |= idxout_emit(io, tail, (size_t)n, 0);
          else

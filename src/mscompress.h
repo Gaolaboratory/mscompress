@@ -476,8 +476,9 @@ void extract_msz(char* input_map, size_t input_filesize, long* indicies,
 /* extract.c — index-tracking output writer (idxout)
  *
  * Wraps the mzML stream emitted by extract_msz in <indexedmzML> and appends a
- * spectrum <indexList> of true absolute byte offsets plus the PSI
- * <fileChecksum> (SHA-1 over the bytes from <indexedmzML through </indexList>).
+ * spectrum <indexList> of true absolute byte offsets plus the required
+ * <indexListOffset> and the PSI <fileChecksum> (SHA-1 over the bytes from
+ * <indexedmzML through </indexList>).
  * Raw-path msz store a bare <mzML> document, so they are wrapped; mzML-path
  * msz whose source document already opens with <indexedmzML pass through
  * verbatim (wrap=0), and finish() only guarantees a trailing newline.
@@ -504,7 +505,9 @@ int idxout_mark_spectrum(idxout_t* io, const char* escaped_id);
 int idxout_finish(idxout_t* io);
 /* wrap mode: appends indexList (one <offset idRef="ID">N</offset> per
    spectrum, ids re-emitted verbatim/escaped-as-stored), updates sha over
-   it, emits <fileChecksum>HEX</fileChecksum></indexedmzML>\n. Passthrough:
+   it, emits <indexListOffset>N</indexListOffset> (N = byte offset of the
+   '<' of <indexList) then <fileChecksum>HEX</fileChecksum></indexedmzML>\n.
+   The sha span stays <indexedmzML .. </indexList> exactly. Passthrough:
    no-op except ensuring the final byte written was '\n' (append one if
    the stream didn't end with one). */
 

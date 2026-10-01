@@ -170,6 +170,19 @@ static void verify_wrapped_output(int fd, const char* buf, size_t len,
    CHECK(get_file_checksum(buf, emitted) == 0, "fileChecksum present");
    CHECK(strcmp(hex, emitted) == 0,
          "fileChecksum equals SHA-1 over <indexedmzML .. </indexList>");
+
+   /* <indexListOffset> is required by the indexedmzML schema and must name
+      the absolute position where our <indexList begins. */
+   const char* ilo = strstr(buf, "<indexListOffset>");
+   CHECK(ilo != NULL, "indexListOffset present");
+   const char* il_start = strstr(buf, "<indexList count=\"1\">");
+   CHECK(il_start != NULL, "found our <indexList");
+   if (ilo && il_start) {
+      uint64_t want = (uint64_t)(il_start - buf);
+      CHECK(strtoull(ilo + strlen("<indexListOffset>"), NULL, 10) == want,
+            "indexListOffset equals position of <indexList");
+      CHECK(ilo > il_end, "indexListOffset emitted after </indexList>");
+   }
 }
 
 /* --- driver ---------------------------------------------------------------- */
@@ -487,6 +500,8 @@ static void test_passthrough_already_indexed(void) {
    }
    CHECK(wraps == 1, "no double wrap in passthrough");
    CHECK(decls == 1, "no injected declaration in passthrough");
+   CHECK(strstr(buf, "<indexListOffset") == NULL,
+         "no indexListOffset injected in passthrough");
 
    free(buf);
    close(fd);
@@ -523,6 +538,8 @@ static void test_passthrough_trailing_newline_kept(void) {
       ssize_t got = read(fd, buf, strlen(doc));
       CHECK(got == (ssize_t)strlen(doc), "read back");
       CHECK(memcmp(buf, doc, strlen(doc)) == 0, "byte-identical passthrough");
+      CHECK(strstr(buf, "<indexListOffset") == NULL,
+            "no indexListOffset injected in passthrough");
       free(buf);
    }
    close(fd);

@@ -153,6 +153,14 @@ def check_fresh_index(tag, data, offsets, expected_count):
     check("%s: fileChecksum == SHA-1 over <indexedmzML .. </indexList>" % tag,
           digest == m.group(1).decode(),
           "recomputed %s, file says %s" % (digest, m.group(1).decode()))
+    # <indexListOffset> is a required indexedmzML child: it must name the
+    # byte position where the <indexList we just verified begins.
+    ilo = re.search(rb"<indexListOffset>(\d+)</indexListOffset>", data)
+    if check("%s: <indexListOffset> present" % tag, ilo is not None):
+        check("%s: indexListOffset == position of <indexList" % tag,
+              int(ilo.group(1)) == data.index(b"<indexList"),
+              "file says %s, actual %d"
+              % (ilo.group(1).decode(), data.index(b"<indexList")))
 
 
 def check_isolation_windows(tag, data):
