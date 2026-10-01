@@ -77,7 +77,7 @@ or
 
 ### Vendor Raw Files
 
-MScompress can compress vendor raw files directly to `.msz` — Thermo `.raw`, Bruker timsTOF `.d` directories, SCIEX `.wiff`/`.wiff2`/`.t2d`, and Waters `.raw` directories — by converting them to mzML in memory through the compiled [raw2ms](https://github.com/chrisagrams/raw2ms) library and feeding the existing compression pipeline:
+MScompress can compress vendor raw files directly to `.msz` — Thermo `.raw`, Bruker `.d` directories (timsTOF TDF, TSF and BAF/QTOF), SCIEX `.wiff`/`.wiff2`/`.t2d`, and Waters `.raw` directories — by converting them to mzML in memory through the compiled [raw2ms](https://github.com/chrisagrams/raw2ms) library and feeding the existing compression pipeline:
 
 ```
 ./mscompress in.raw
@@ -89,7 +89,8 @@ Requirements and behavior:
 - The mzML intermediate is built fully in memory when an OOM check says it fits; for large runs it is instead streamed spectrum-by-spectrum into an anonymous in-memory staging file and processed through a memory map, keeping peak memory bounded. (Set `MSCOMPRESS_FORCE_CHUNKED=1` to force the chunked path.)
 - SCIEX `.wiff` files can hold several runs (samples). One invocation converts one run; `--run-index N` selects which (default 0), and the log reports how many runs the file holds.
 - All compression flags (`--mz-lossy`, `--int-lossy`, threads, formats, blocksize) apply as with mzML input. `--extract`/`--describe` require an `.msz` or `.mzML` file — compress the vendor file first.
-- Corrupt input fails with the reader's diagnosis (a truncated Bruker `.d`, for instance, is reported with byte counts before any conversion work starts). `--salvage` instead skips spectra the reader cannot decode, warns with a summary, and converts the rest; a file that is truncated on disk is still rejected outright — re-download it.
+- Corrupt input fails with the reader's diagnosis (a truncated Bruker `.d`, for instance, is reported with byte counts before any conversion work starts). `--salvage` instead skips spectra the reader cannot decode, warns with a summary, and converts the rest; a Bruker `.d` that is truncated on disk is still rejected outright — re-download it.
+- A corrupt Thermo `.raw` — truncated, with a zero-filled tail, or with data blocks shifted inside it — is also refused, with a hint. Under `--salvage` raw2ms recovers as much as possible instead, **with no quality guarantee**: a warning says what was lost, the mzML's `fileContent` carries the same account, and the output is named `<name>_recovered.msz` (an explicit output path ending in `.msz` gets the suffix too; any other explicit path is left as given). A file that lost its scan index also loses retention times and precursors. Needs a raw2ms library with `raw2ms_open_ex`; with an older one `--salvage` only skips unreadable spectra.
 - Per-peak ion mobility arrays (Bruker) are not stored; the `.msz` format carries m/z and intensity binary streams only.
 
 ### Decompression

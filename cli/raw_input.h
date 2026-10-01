@@ -2,8 +2,9 @@
  * @file raw_input.h
  * @brief Direct vendor raw file support: raw -> mzML (in memory) -> msz.
  *
- * Reads Thermo (.raw), Bruker timsTOF (.d), SCIEX (.wiff/.wiff2/.t2d) and
- * Waters (.raw directory) files through the compiled raw2ms C library
+ * Reads Thermo (.raw), Bruker timsTOF (TDF .d, TSF .d, BAF .d), SCIEX
+ * (.wiff/.wiff2/.t2d) and Waters (.raw directory) files through the
+ * compiled raw2ms C library
  * (libraw2ms_capi) loaded at runtime with dlopen()/LoadLibraryA(), then
  * synthesizes an mzML document and feeds it into the existing compression
  * pipeline (preprocess_mzml + compress_mzml).
@@ -28,6 +29,8 @@
 #define RAW_VENDOR_SCIEX 3
 #define RAW_VENDOR_WATERS 4
 #define RAW_VENDOR_SCIEX_T2D 5
+#define RAW_VENDOR_BRUKER_TSF 6  /* Bruker .d without mobility (TSF) */
+#define RAW_VENDOR_BRUKER_BAF 7  /* Bruker QTOF .d (BAF): micrOTOF, impact, maXis */
 
 /* Polarity / peak-mode codes mirrored from the raw2ms C ABI. */
 #define RAW_POLARITY_POSITIVE 1
@@ -85,6 +88,9 @@ typedef struct {
    const char* instrument_model; /* may be NULL or "" */
    const char* raw2ms_version;   /* version of the reader, may be NULL */
    int32_t vendor;               /* RAW_VENDOR_* */
+   /* Set when the vendor file was corrupt and raw2ms recovered what it could
+    * (--salvage): its account of what was lost. NULL for a healthy file. */
+   const char* recovery;
 } raw_run_t;
 
 /**
@@ -177,12 +183,17 @@ int is_raw_vendor_path(const char* path);
  * @param input_path Path to the vendor file.
  * @param run_index Run to convert inside multi-run containers (.wiff).
  * @param salvage Skip unreadable spectra instead of failing (see
- *                raw_write_mzml_mem).
+ *                raw_write_mzml_mem), and ask raw2ms to recover a corrupt
+ *                file (truncated, zero-filled tail, shifted data blocks)
+ *                instead of refusing it.
  * @param arguments Populated CLI arguments.
  * @param output_fd Open output .msz file descriptor.
+ * @param recovered Out, may be NULL: set to 1 when the file was corrupt and
+ *                  raw2ms recovered it (the caller names the output
+ *                  *_recovered.msz), 0 otherwise.
  * @return 0 on success, -1 on failure (message already printed).
  */
 int compress_raw(const char* input_path, uint64_t run_index, int salvage,
-                 Arguments* arguments, int output_fd);
+                 Arguments* arguments, int output_fd, int* recovered);
 
 #endif /* RAW_INPUT_H */

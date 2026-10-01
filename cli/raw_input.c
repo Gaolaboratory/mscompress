@@ -228,6 +228,12 @@ static void source_file_cv(int32_t vendor, const char** acc, const char** name) 
       case RAW_VENDOR_BRUKER_TIMS:
          *acc = "MS:1002817", *name = "Bruker TDF format";
          break;
+      case RAW_VENDOR_BRUKER_TSF:
+         *acc = "MS:1003282", *name = "Bruker TSF format";
+         break;
+      case RAW_VENDOR_BRUKER_BAF:
+         *acc = "MS:1000815", *name = "Bruker BAF format";
+         break;
       case RAW_VENDOR_SCIEX:
          *acc = "MS:1000562", *name = "ABI WIFF format";
          break;
@@ -242,8 +248,9 @@ static void source_file_cv(int32_t vendor, const char** acc, const char** name) 
 
 /* sourceFile nativeID-format cvParam per vendor: the psi-ms term whose
  * definition matches the id syntax the raw2ms reader for that vendor
- * produces (Thermo: controllerType=.. controllerNumber=.. scan=N, Bruker:
- * frame=F scan=S, Waters: function=F process=P scan=S, SCIEX: scan=N).
+ * produces (Thermo: controllerType=.. controllerNumber=.. scan=N, Bruker
+ * TDF: frame=F scan=S, Bruker TSF: frame=F, Bruker BAF: scan=N, Waters:
+ * function=F process=P scan=S, SCIEX: scan=N).
  * Mirrors raw2ms's own writer; declaring a format the ids do not follow is
  * worse than the generic term, so the two must stay in step. */
 static void native_id_cv(int32_t vendor, const char** acc, const char** name) {
@@ -253,6 +260,12 @@ static void native_id_cv(int32_t vendor, const char** acc, const char** name) {
          break;
       case RAW_VENDOR_BRUKER_TIMS:
          *acc = "MS:1002818", *name = "Bruker TDF nativeID format";
+         break;
+      case RAW_VENDOR_BRUKER_TSF:
+         *acc = "MS:1003283", *name = "Bruker TSF nativeID format";
+         break;
+      case RAW_VENDOR_BRUKER_BAF:
+         *acc = "MS:1000772", *name = "Bruker BAF nativeID format";
          break;
       case RAW_VENDOR_WATERS:
          *acc = "MS:1000769", *name = "Waters nativeID format";
@@ -300,17 +313,25 @@ static int mzml_write_header(sink_t* s, const raw_run_t* run, uint64_t count) {
    /* fileContent is a manifest. The C API does not expose run-level MS
     * levels, so declare MS1 (levels unknown degrade to MS1 there too, and
     * every spectrum carries its own authoritative ms level cvParam). */
-   if (count > 0) {
-      if (sink_printf(
-              s,
-              "<fileDescription><fileContent><cvParam cvRef=\"MS\" "
-              "accession=\"MS:1000579\" name=\"MS1 spectrum\" value=\"\"/>"
-              "</fileContent>"))
+   if (sink_printf(s, "<fileDescription><fileContent>"))
+      return -1;
+   if (count > 0 &&
+       sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1000579\" "
+                      "name=\"MS1 spectrum\" value=\"\"/>"))
+      return -1;
+   /* A recovered file must not pass for a clean conversion once its log is
+    * gone, so raw2ms's account of the damage travels inside it. */
+   if (run->recovery != NULL) {
+      if (sink_printf(s, "<userParam name=\"raw2ms recovered from a corrupt "
+                         "file; no quality guarantee\" value=\""))
          return -1;
-   } else {
-      if (sink_printf(s, "<fileDescription><fileContent>"))
+      if (sink_put_escaped(s, run->recovery))
+         return -1;
+      if (sink_printf(s, "\"/>"))
          return -1;
    }
+   if (sink_printf(s, "</fileContent>"))
+      return -1;
    if (sink_printf(
            s,
            "<sourceFileList count=\"1\"><sourceFile id=\"sf1\" name=\""))
@@ -452,7 +473,10 @@ static int mzml_write_spectrum(sink_t* s, const raw_spec_t* spec, uint64_t seq) 
                       "accession=\"MS:1000795\" name=\"no combination\" value=\"\"/>"
                       "<scan instrumentConfigurationRef=\"IC1\">"))
       return -1;
-   if (sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1000016\" "
+   /* NaN when a recovered file lost its scan index: left out, since neither
+    * 0 nor "nan" is a time the scan was taken at. */
+   if (!is_nan(spec->rt_seconds) &&
+       sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1000016\" "
                       "name=\"scan start time\" value=\"%.6f\" unitCvRef=\"UO\" "
                       "unitAccession=\"UO:0000010\" unitName=\"second\"/>",
                    spec->rt_seconds))
@@ -760,7 +784,13 @@ typedef struct {
    const char* (*instrument_model)(const void* run);
    void* (*spectrum)(const void* run, uint64_t index);
    void (*spectrum_free)(void* spectrum);
+   /* Optional: absent from raw2ms libraries older than recovery mode. */
+   void* (*open_ex)(const char* path, uint64_t run_index, uint32_t flags);
+   const char* (*recovery)(const void* run);
 } raw2ms_api_t;
+
+/* RAW2MS_OPEN_RECOVER in raw2ms.h. */
+#define RAW2MS_OPEN_RECOVER 1u
 
 static raw2ms_api_t g_raw2ms;
 static int g_raw2ms_tried = 0;
@@ -843,6 +873,10 @@ static int raw2ms_load(void) {
    g_raw2ms.instrument_model = (const char* (*)(const void*))fns[9];
    g_raw2ms.spectrum = (void* (*)(const void*, uint64_t))fns[10];
    g_raw2ms.spectrum_free = (void (*)(void*))fns[11];
+   g_raw2ms.open_ex = (void* (*)(const char*, uint64_t, uint32_t))msc_dlsym(
+       handle, "raw2ms_open_ex");
+   g_raw2ms.recovery =
+       (const char* (*)(const void*))msc_dlsym(handle, "raw2ms_recovery");
    return 0;
 }
 
@@ -1023,18 +1057,38 @@ static int run_compress_pipeline(char* map, size_t len, Arguments* arguments,
    return rc;
 }
 
+/* raw2ms's open error, plus what mscompress can do about a corrupt file. */
+static void report_open_error(const char* what, const char* input_path,
+                              int salvage) {
+   const char* e = g_raw2ms.last_error();
+   error("raw_input: %s %s: %s\n", what, input_path, e ? e : "unknown error");
+   if (!salvage && e != NULL && strstr(e, "corrupt") != NULL)
+      error("raw_input: pass --salvage to recover as much as possible from "
+            "this corrupt file (no quality guarantee; the output is named "
+            "*_recovered.msz).\n");
+}
+
 int compress_raw(const char* input_path, uint64_t run_index, int salvage,
-                 Arguments* arguments, int output_fd) {
+                 Arguments* arguments, int output_fd, int* recovered) {
+   if (recovered != NULL)
+      *recovered = 0;
    if (raw2ms_load() != 0)
       return -1;
+   /* --salvage asks raw2ms to recover a corrupt file rather than refuse it.
+    * The run count comes from a plain open, which a corrupt file fails, so
+    * with recovery on that failure is left to the recovering open below
+    * (which checks the run index itself). */
+   int recover = salvage && g_raw2ms.open_ex != NULL;
+   if (salvage && !recover)
+      warning("raw_input: this raw2ms library predates recovery mode; "
+              "--salvage only skips unreadable spectra.\n");
 
    int64_t n_runs = g_raw2ms.run_count(input_path);
-   if (n_runs < 0) {
-      error("raw_input: cannot inspect %s: %s\n", input_path,
-            g_raw2ms.last_error() ? g_raw2ms.last_error() : "unknown error");
+   if (n_runs < 0 && !recover) {
+      report_open_error("cannot inspect", input_path, salvage);
       return -1;
    }
-   if ((int64_t)run_index >= n_runs) {
+   if (n_runs >= 0 && (int64_t)run_index >= n_runs) {
       error("raw_input: --run-index %llu is out of range; file holds %lld "
             "run(s).\n",
             (unsigned long long)run_index, (long long)n_runs);
@@ -1045,11 +1099,19 @@ int compress_raw(const char* input_path, uint64_t run_index, int salvage,
               "another with --run-index).\n",
               (long long)n_runs, (unsigned long long)run_index);
 
-   void* run = g_raw2ms.open(input_path, run_index);
+   void* run = recover ? g_raw2ms.open_ex(input_path, run_index, RAW2MS_OPEN_RECOVER)
+                       : g_raw2ms.open(input_path, run_index);
    if (run == NULL) {
-      error("raw_input: cannot open %s: %s\n", input_path,
-            g_raw2ms.last_error() ? g_raw2ms.last_error() : "unknown error");
+      report_open_error("cannot open", input_path, salvage);
       return -1;
+   }
+   const char* recovery = g_raw2ms.recovery ? g_raw2ms.recovery(run) : NULL;
+   if (recovery != NULL) {
+      warning("raw_input: %s is corrupt. raw2ms recovered as much as possible, "
+              "but no quality is guaranteed -- %s\n",
+              input_path, recovery);
+      if (recovered != NULL)
+         *recovered = 1;
    }
 
    int rc = -1;
@@ -1090,6 +1152,7 @@ int compress_raw(const char* input_path, uint64_t run_index, int salvage,
    rr.instrument_model = g_raw2ms.instrument_model(run);
    rr.raw2ms_version = g_raw2ms.version();
    rr.vendor = g_raw2ms.vendor(run);
+   rr.recovery = recovery;
 
    if (!chunked) {
       mzml_buf_t doc;
