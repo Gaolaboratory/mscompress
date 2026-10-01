@@ -212,6 +212,31 @@ add_test(NAME CompressNoBinaryArrays
     -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test_fail.cmake
 )
 
+# --extract-scans regression tests: the extracted mzML must contain exactly
+# the requested spectra. Regression: the parsed scan numbers used to be
+# stored through a uint32_t* view of the long* array returned by
+# string_to_array(), so on LP64 every other scan was replaced by a zero
+# ("3,9" extracted only scan 3, "2-25" extracted scans 2-13).
+macro(add_extract_scans_test TEST_NAME SCAN_SPEC EXPECTED_SCANS)
+    add_test(NAME ${TEST_NAME}
+        COMMAND ${CMAKE_COMMAND}
+        -DEXECUTABLE=$<TARGET_FILE:mscompress>
+        -DINPUT_FILE=${TEST_DATA_DIR}/test.mzML
+        "-DSCAN_SPEC=${SCAN_SPEC}"
+        "-DEXPECTED_SCANS=${EXPECTED_SCANS}"
+        -DTEMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/tmp_${TEST_NAME}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test_extract_scans.cmake
+    )
+endmacro()
+
+add_extract_scans_test(ExtractScansSingle "3" "3")
+add_extract_scans_test(ExtractScansList "3,9" "3;9")
+add_extract_scans_test(ExtractScansRange "2-5" "2;3;4;5")
+add_extract_scans_test(ExtractScansBracketList "[1-3,5-6]" "1;2;3;5;6")
+add_extract_scans_test(ExtractScansMixed "1,3-5" "1;3;4;5")
+# Both ends of the fixture's spectrum list (50 spectra, scan=1..50).
+add_extract_scans_test(ExtractScansFileEnds "1,50" "1;50")
+
 # Verbose mode test
 add_test(NAME VerboseOutputTest
     COMMAND ${CMAKE_COMMAND}
