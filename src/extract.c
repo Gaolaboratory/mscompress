@@ -1556,7 +1556,10 @@ void extract_msz(char* input_map, size_t input_filesize, long* indicies,
          goto finish_output;
       }
       free(spec_id);
-      idxout_write(&idxout, spectrum + lead, spectra_len - lead);
+      if (idxout_write(&idxout, spectrum + lead, spectra_len - lead) != 0) {
+         free(spectrum);
+         goto finish_output; /* counter no longer tracks the fd: stop */
+      }
       free(spectrum);
    }
 
@@ -1579,7 +1582,10 @@ void extract_msz(char* input_map, size_t input_filesize, long* indicies,
    }
    char* mzml_footer = extract_mzml_footer(decmp_xml, divisions, &footer_len);
    // print("%s\n", mzml_footer);
-   idxout_write(&idxout, mzml_footer, footer_len);
+   if (idxout_write(&idxout, mzml_footer, footer_len) != 0) {
+      free(mzml_footer);
+      goto finish_output;
+   }
    free(mzml_footer);
 
 finish_output:

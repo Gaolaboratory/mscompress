@@ -372,6 +372,35 @@ static void test_wrap_declless_header(void) {
    free(buf);
 }
 
+/* Thermo-style nativeIDs contain spaces (raw2ms emits them verbatim); the
+   id must travel through idRef="…" byte-exact. Seen in the wild as
+   id="controllerType=0 controllerNumber=1 scan=N". */
+static void test_wrap_spaced_thermo_id(void) {
+   const char* header =
+      "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+      "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\">"
+      "<spectrumList count=\"1\">";
+   const char* specs[] = {
+      "<spectrum index=\"4\" id=\"controllerType=0 controllerNumber=1 scan=5\""
+      " defaultArrayLength=\"3\"><binary>AQID</binary></spectrum>\n",
+   };
+   const char* ids[] = {"controllerType=0 controllerNumber=1 scan=5"};
+   const char* footer = "</spectrumList></mzML>\n";
+
+   size_t len = 0;
+   int fd = -1;
+   char* buf = run_idxout(header, specs, ids, 1, footer, &len, &fd);
+   if (!buf)
+      return;
+   CHECK(strstr(buf,
+                "<offset idRef=\"controllerType=0 controllerNumber=1 "
+                "scan=5\">") != NULL,
+         "spaced nativeID re-emitted verbatim in idRef");
+   verify_wrapped_output(fd, buf, len, ids, 1);
+   close(fd);
+   free(buf);
+}
+
 /* Leading whitespace before <spectrum must not shift the recorded offset. */
 static void test_wrap_leading_whitespace_chunk(void) {
    const char* header =
@@ -504,6 +533,7 @@ int main(void) {
    RUN_TEST(test_wrap_two_spectra);
    RUN_TEST(test_wrap_filtered_single_spectrum);
    RUN_TEST(test_wrap_escaped_id_roundtrips);
+   RUN_TEST(test_wrap_spaced_thermo_id);
    RUN_TEST(test_wrap_without_footer_newline);
    RUN_TEST(test_wrap_declless_header);
    RUN_TEST(test_wrap_leading_whitespace_chunk);
