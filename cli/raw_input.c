@@ -7,6 +7,11 @@
  * zero-peak spectra keep a two-array binaryDataArrayList with empty
  * <binary></binary> elements, because mscompress's scan_mzml() requires
  * exactly two <binary> elements per spectrum.
+ *
+ * The stored XML is newline-terminated (one spectrum per line, every closing
+ * top-level element ends its line, the document ends with '\n') for parity
+ * with msconvert-produced mzML; the scanners pattern-match elements and do
+ * not count bytes, so the whitespace is insignificant to msz itself.
  */
 
 #include "raw_input.h"
@@ -307,7 +312,7 @@ static int mzml_write_header(sink_t* s, const raw_run_t* run, uint64_t count) {
            "URI=\"https://raw.githubusercontent.com/HUPO-PSI/psi-ms-CV/master/"
            "psi-ms.obo\"/><cv id=\"UO\" fullName=\"Unit Ontology\" "
            "version=\"09:04:2014\" URI=\"https://github.com/"
-           "bio-ontology-research-group/unit-ontology/master/unit.obo\"/></cvList>"))
+           "bio-ontology-research-group/unit-ontology/master/unit.obo\"/></cvList>\n"))
       return -1;
 
    /* fileContent is a manifest. The C API does not expose run-level MS
@@ -342,7 +347,7 @@ static int mzml_write_header(sink_t* s, const raw_run_t* run, uint64_t count) {
            s,
            "\" location=\"\"><cvParam cvRef=\"MS\" accession=\"%s\" name=\"%s\" "
            "value=\"\"/><cvParam cvRef=\"MS\" accession=\"%s\" name=\"%s\" "
-           "value=\"\"/></sourceFile></sourceFileList></fileDescription>",
+           "value=\"\"/></sourceFile></sourceFileList></fileDescription>\n",
            src_acc, src_name, nid_acc, nid_name))
       return -1;
 
@@ -354,7 +359,7 @@ static int mzml_write_header(sink_t* s, const raw_run_t* run, uint64_t count) {
            "<software id=\"mscompress\" version=\"%s\">"
            "<cvParam cvRef=\"MS\" accession=\"MS:1000799\" name=\"custom "
            "unreleased software tool\" value=\"mscompress\"/></software>"
-           "</softwareList>",
+           "</softwareList>\n",
            run->raw2ms_version ? run->raw2ms_version : "0",
            VERSION))
       return -1;
@@ -365,7 +370,8 @@ static int mzml_write_header(sink_t* s, const raw_run_t* run, uint64_t count) {
       return -1;
    if (sink_put_escaped(s, run->instrument_model ? run->instrument_model : ""))
       return -1;
-   if (sink_printf(s, "\"/></instrumentConfiguration></instrumentConfigurationList>"))
+   if (sink_printf(
+           s, "\"/></instrumentConfiguration></instrumentConfigurationList>\n"))
       return -1;
 
    if (sink_printf(
@@ -374,13 +380,14 @@ static int mzml_write_header(sink_t* s, const raw_run_t* run, uint64_t count) {
            "<processingMethod order=\"0\" softwareRef=\"raw2ms\">"
            "<cvParam cvRef=\"MS\" accession=\"MS:1000544\" name=\"Conversion to "
            "mzML\" value=\"\"/></processingMethod></dataProcessing>"
-           "</dataProcessingList>"))
+           "</dataProcessingList>\n"))
       return -1;
 
    if (sink_printf(s, "<run id=\"%s\" defaultInstrumentConfigurationRef=\"IC1\" "
                       "defaultSourceFileRef=\"sf1\">", run_id))
       return -1;
-   if (sink_printf(s, "<spectrumList count=\"%llu\" defaultDataProcessingRef=\"dp1\">",
+   if (sink_printf(s,
+                   "<spectrumList count=\"%llu\" defaultDataProcessingRef=\"dp1\">\n",
                    (unsigned long long)count))
       return -1;
    return 0;
@@ -603,13 +610,13 @@ static int mzml_write_spectrum(sink_t* s, const raw_spec_t* spec, uint64_t seq) 
    if (sink_printf(s, "</binary></binaryDataArray></binaryDataArrayList>"))
       return -1;
 
-   if (sink_printf(s, "</spectrum>"))
+   if (sink_printf(s, "</spectrum>\n"))
       return -1;
    return 0;
 }
 
 static int mzml_write_footer(sink_t* s) {
-   return sink_printf(s, "</spectrumList></run></mzML>");
+   return sink_printf(s, "</spectrumList>\n</run>\n</mzML>\n");
 }
 
 static int raw_write_mzml(const raw_run_t* run, sink_t* s, int salvage) {

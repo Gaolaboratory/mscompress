@@ -359,6 +359,48 @@ static void test_metadata_and_escaping(void) {
    free(doc.buf);
 }
 
+/* A1: the stored XML is newline-terminated, one spectrum per line. Downstream
+ * consumers (the extraction-time index, the campaign's C1 check) need a '\n'
+ * after every </spectrum> and after each closing top-level element, with the
+ * document's final byte a newline. */
+static void test_stored_xml_newlines(void) {
+   mzml_buf_t doc;
+   if (write_doc(&doc))
+      return;
+
+   const char* out = doc.buf;
+   CHECK(out[doc.len - 1] == '\n', "document must end with newline");
+
+   int n_spec = 0, n_nl_spec = 0;
+   for (const char* p = out; (p = strstr(p, "</spectrum>")) != NULL; p += 11)
+      n_spec++;
+   for (const char* p = out; (p = strstr(p, "</spectrum>\n")) != NULL; p += 12)
+      n_nl_spec++;
+   CHECK(n_spec == 3, "write_doc emits three spectra");
+   CHECK(n_spec == n_nl_spec, "every </spectrum> must be followed by \\n");
+
+   /* One spectrum per line cuts both ways: each opens at a line start. */
+   int n_open = 0, n_nl_open = 0;
+   for (const char* p = out; (p = strstr(p, "<spectrum ")) != NULL; p += 10)
+      n_open++;
+   for (const char* p = out; (p = strstr(p, "\n<spectrum ")) != NULL; p += 11)
+      n_nl_open++;
+   CHECK(n_open == 3 && n_open == n_nl_open,
+         "every <spectrum> must start on its own line");
+
+   CHECK(strstr(out, "</spectrumList>\n") != NULL, "spectrumList close newline");
+   CHECK(strstr(out, "</run>\n") != NULL, "run close newline");
+   CHECK(strstr(out, "</mzML>\n") != NULL, "mzML close newline");
+   CHECK(strstr(out, "</cvList>\n") != NULL &&
+             strstr(out, "</fileDescription>\n") != NULL &&
+             strstr(out, "</softwareList>\n") != NULL &&
+             strstr(out, "</instrumentConfigurationList>\n") != NULL &&
+             strstr(out, "</dataProcessingList>\n") != NULL,
+         "every closing top-level header element ends its line");
+
+   free(doc.buf);
+}
+
 /* raw2ms declares the psi-ms nativeID-format term matching the id syntax
  * each vendor's reader produces; the writer here must declare the same term
  * (declaring a format the ids do not follow is worse than none). */
@@ -691,6 +733,7 @@ int main(void) {
    RUN_TEST(test_empty_spectrum_has_zero_length_binaries);
    RUN_TEST(test_base64_arrays_roundtrip);
    RUN_TEST(test_metadata_and_escaping);
+   RUN_TEST(test_stored_xml_newlines);
    RUN_TEST(test_native_id_format_cvparam_per_vendor);
    RUN_TEST(test_mzml_is_well_formed_xml);
    RUN_TEST(test_recovered_run_omits_lost_times_and_says_so);
