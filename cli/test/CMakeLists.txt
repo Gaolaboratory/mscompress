@@ -24,6 +24,30 @@ endif()
 add_dependencies(test_raw_writer zlib_build)
 add_test(NAME RawWriterTest COMMAND test_raw_writer)
 
+# Unit tests for the index-tracking extraction writer (idxout_* in
+# src/extract.c). Runs without any input file: the writer is driven directly
+# against a temp file and the produced document is verified byte-for-byte
+# (offsets, indexList, PSI fileChecksum).
+file(GLOB IDX_WRITER_CORE_SOURCES ${SRC_DIR}/*.c ${SRC_DIR}/algos/*.c)
+add_executable(test_idx_writer test_idx_writer.c ${IDX_WRITER_CORE_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../sha1.c)
+target_include_directories(test_idx_writer PUBLIC
+    ${VENDOR_DIR}/zstd/lib
+    ${VENDOR_DIR}/base64/include
+    ${VENDOR_DIR}/base64/lib
+    ${VENDOR_DIR}/yxml
+    ${VENDOR_DIR}/lz4/include
+    ${SRC_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+if(WIN32)
+    target_link_libraries(test_idx_writer PRIVATE base64 lz4 ${ZLIB_LIBRARY} zstd yxml)
+else()
+    target_link_libraries(test_idx_writer PRIVATE base64 lz4 ${ZLIB_LIBRARY} zstd yxml m Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+add_dependencies(test_idx_writer zlib_build)
+add_test(NAME IdxWriterTest COMMAND test_idx_writer)
+
 # Simple test to run the executable with --version and --help
 add_test(NAME VersionTest COMMAND mscompress --version)
 

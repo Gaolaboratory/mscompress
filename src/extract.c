@@ -4,6 +4,14 @@
 
 #include "mscompress.h"
 
+#ifdef _WIN32
+#include <io.h>
+#define write _write
+#define ssize_t int
+#else
+#include <unistd.h>
+#endif
+
 /**
  * @brief Updates the spectrumList count value in an mzML header.
  * @param header The header buffer to modify.
@@ -1112,8 +1120,306 @@ char* extract_spectra(char* input_map, ZSTD_DCtx* dctx, data_format_t* df,
    return res;
 }
 
+/* === index-tracking output writer (idxout) =============================== */
+
+/*
+ * Extraction reassembles an mzML document from spliced XML chunks and
+ * re-encoded binary arrays, so any index the source document carried is
+ * stale by construction. idxout streams the extracted output through one
+ * place: it counts bytes from byte 0 of the output, and for stores holding a
+ * bare <mzML> document (the raw path) it re-opens the document under
+ * <indexedmzML> so a spectrum <indexList> of true absolute offsets and the
+ * PSI <fileChecksum> can be appended. Stores whose document already opens
+ * with <indexedmzML (the mzML path) pass through verbatim.
+ */
+
+/* Writes len bytes to io->fd (retrying short writes), maintaining the
+ * absolute byte count, the trailing-newline state and — in wrap mode, when
+ * hash is set — the running SHA-1 over <indexedmzML .. </indexList>.
+ * Returns 0 on success, -1 on a write failure. */
+static int idxout_emit(idxout_t* io, const void* buf, size_t len, int hash) {
+   const char* p = (const char*)buf;
+   size_t left = len;
+
+   if (len == 0)
+      return 0;
+
+   while (left > 0) {
+      ssize_t n = write(io->fd, p, left);
+      if (n <= 0) {
+         error("idxout: write of %zu bytes failed.\n", len);
+         return -1;
+      }
+      p += n;
+      left -= (size_t)n;
+   }
+
+   if (hash && io->wrap)
+      sha1_update(&io->sha, buf, len);
+   io->written += len;
+   io->last_nl = (p[-1] == '\n');
+   return 0;
+}
+
+/* Returns the byte just past the closing "?>" of an <?xml declaration
+ * opening buf, or NULL when buf does not start with one. */
+static const char* idx_after_xml_decl(const char* buf, size_t len) {
+   size_t i = 0;
+   while (i < len && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\r' ||
+                      buf[i] == '\n'))
+      i++;
+   if (i + 5 > len || memcmp(buf + i, "<?xml", 5) != 0)
+      return NULL;
+   for (size_t j = i + 5; j + 1 < len; j++)
+      if (buf[j] == '?' && buf[j + 1] == '>')
+         return buf + j + 2;
+   return NULL;
+}
+
+int idxout_begin(idxout_t* io, int fd, const char* first_xml,
+                 size_t first_len) {
+   const char* p;
+   size_t rem;
+   const char* decl_end;
+
+   memset(io, 0, sizeof(*io));
+   io->fd = fd;
+   if (!first_xml)
+      first_len = 0;
+
+   p = first_xml;
+   rem = first_len;
+
+   /* Tolerate a UTF-8 BOM before the declaration (dropped in wrap mode: we
+    * emit our own declaration). */
+   if (rem >= 3 && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB &&
+       (unsigned char)p[2] == 0xBF) {
+      p += 3;
+      rem -= 3;
+   }
+
+   decl_end = idx_after_xml_decl(p, rem);
+   if (decl_end) {
+      rem -= (size_t)(decl_end - p);
+      p = decl_end;
+   }
+   while (rem > 0 &&
+          (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) {
+      p++;
+      rem--;
+   }
+
+   if (rem >= 12 && memcmp(p, "<indexedmzML", 12) == 0) {
+      /* Source document already carries an index: emit it verbatim,
+       * declaration included; its own indexList travels with the stream. */
+      io->wrap = 0;
+      return idxout_emit(io, first_xml, first_len, 0);
+   }
+
+   io->wrap = 1;
+   sha1_init(&io->sha);
+   /* Our declaration sits outside the checksum span; the span starts at the
+    * first byte of <indexedmzML (PSI convention). */
+   if (idxout_emit(io, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
+                   sizeof("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n") - 1,
+                   0))
+      return -1;
+   if (idxout_emit(io, "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n",
+                   sizeof("<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n") -
+                       1,
+                   1))
+      return -1;
+   /* Re-emit the stored document from its <mzML root; the stored XML
+    * declaration was replaced by ours above. */
+   return idxout_emit(io, p, rem, 1);
+}
+
+int idxout_write(idxout_t* io, const void* buf, size_t len) {
+   return idxout_emit(io, buf, len, 1);
+}
+
+int idxout_mark_spectrum(idxout_t* io, const char* escaped_id) {
+   size_t id_len;
+   char* id;
+
+   if (!io->wrap)
+      return 0; /* passthrough: the source index stays authoritative */
+
+   if (!escaped_id) {
+      error("idxout_mark_spectrum: NULL spectrum id.\n");
+      return -1;
+   }
+
+   if (io->n_spec == io->cap_spec) {
+      size_t cap = io->cap_spec ? io->cap_spec * 2 : 64;
+      uint64_t* offs = realloc(io->spec_offsets, cap * sizeof(uint64_t));
+      char** ids;
+      if (!offs)
+         return -1;
+      io->spec_offsets = offs;
+      ids = realloc(io->spec_ids, cap * sizeof(char*));
+      if (!ids)
+         return -1;
+      io->spec_ids = ids;
+      io->cap_spec = cap;
+   }
+
+   id_len = strlen(escaped_id);
+   id = malloc(id_len + 1);
+   if (!id)
+      return -1;
+   memcpy(id, escaped_id, id_len + 1);
+
+   io->spec_offsets[io->n_spec] = io->written;
+   io->spec_ids[io->n_spec] = id;
+   io->n_spec++;
+   return 0;
+}
+
+int idxout_finish(idxout_t* io) {
+   int rv = 0;
+   size_t i;
+
+   if (io->wrap) {
+      /* Keep the index block on its own line; a newline inserted here is
+       * within the checksum span, so it is hashed like the rest. */
+      if (io->written > 0 && !io->last_nl)
+         rv |= idxout_emit(io, "\n", 1, 1);
+
+      rv |= idxout_emit(io,
+                        "<indexList count=\"1\"><index name=\"spectrum\">\n",
+                        sizeof("<indexList count=\"1\"><index name=\"spectrum\">\n") -
+                            1,
+                        1);
+
+      for (i = 0; i < io->n_spec && rv == 0; i++) {
+         /* One <offset> per spectrum actually emitted; the id's escaped
+          * bytes are re-emitted verbatim (valid inside id="…", hence valid
+          * inside idRef="…"). */
+         size_t need = strlen(io->spec_ids[i]) + 64;
+         char* line = malloc(need);
+         int n;
+         if (!line) {
+            rv = -1;
+            break;
+         }
+         n = snprintf(line, need, "<offset idRef=\"%s\">%llu</offset>\n",
+                      io->spec_ids[i],
+                      (unsigned long long)io->spec_offsets[i]);
+         if (n > 0 && (size_t)n < need)
+            rv |= idxout_emit(io, line, (size_t)n, 1);
+         else
+            rv = -1;
+         free(line);
+      }
+
+      /* The last byte of </indexList> closes the checksum span. */
+      rv |= idxout_emit(io, "</index></indexList>",
+                        sizeof("</index></indexList>") - 1, 1);
+
+      if (rv == 0) {
+         uint8_t digest[20];
+         char hex[41];
+         char tail[41 + 64];
+         int n;
+         static const char digits[] = "0123456789abcdef";
+
+         sha1_final(&io->sha, digest);
+         for (i = 0; i < 20; i++) {
+            hex[i * 2] = digits[digest[i] >> 4];
+            hex[i * 2 + 1] = digits[digest[i] & 0x0F];
+         }
+         hex[40] = '\0';
+
+         /* The checksum element itself is outside the span it covers. */
+         n = snprintf(tail, sizeof(tail),
+                      "\n<fileChecksum>%s</fileChecksum></indexedmzML>\n",
+                      hex);
+         if (n > 0 && (size_t)n < sizeof(tail))
+            rv |= idxout_emit(io, tail, (size_t)n, 0);
+         else
+            rv = -1;
+      }
+   } else {
+      /* Passthrough: only guarantee the stream is newline-terminated. */
+      if (io->written > 0 && !io->last_nl)
+         rv |= idxout_emit(io, "\n", 1, 0);
+   }
+
+   if (io->spec_ids)
+      for (i = 0; i < io->n_spec; i++)
+         free(io->spec_ids[i]);
+   free(io->spec_ids);
+   free(io->spec_offsets);
+   io->spec_ids = NULL;
+   io->spec_offsets = NULL;
+   io->n_spec = io->cap_spec = 0;
+
+   return rv ? -1 : 0;
+}
+
+/* Extracts the id attribute of the <spectrum element opening a chunk. The
+ * search is bounded to the opening tag so attributes of nested elements can
+ * never match, and `id` must sit at an attribute boundary. *lead receives
+ * the number of whitespace bytes preceding '<' (normally 0) so the caller
+ * can mark the exact '<' position. Returns a malloc'd, NUL-terminated copy
+ * of the attribute's raw (escaped) bytes, or NULL when the chunk does not
+ * open a <spectrum element or carries no id="…". */
+static char* spectrum_id_from_chunk(const char* buf, size_t len,
+                                    size_t* lead) {
+   const char* tag;
+   const char* tag_end;
+   size_t rem, j;
+
+   *lead = 0;
+   while (*lead < len && (buf[*lead] == ' ' || buf[*lead] == '\t' ||
+                          buf[*lead] == '\r' || buf[*lead] == '\n'))
+      (*lead)++;
+
+   tag = buf + *lead;
+   rem = len - *lead;
+
+   /* Must open a <spectrum element: the next byte separates it from
+    * <spectrumList and friends. */
+   if (rem < 10 || memcmp(tag, "<spectrum", 9) != 0)
+      return NULL;
+   if (tag[9] != ' ' && tag[9] != '\t' && tag[9] != '\r' && tag[9] != '\n' &&
+       tag[9] != '>' && tag[9] != '/')
+      return NULL;
+
+   tag_end = memchr(tag, '>', rem);
+   if (!tag_end)
+      return NULL;
+
+   for (j = 0; j + 4 < (size_t)(tag_end - tag); j++) {
+      if (tag[j] == 'i' && tag[j + 1] == 'd' && tag[j + 2] == '=' &&
+          tag[j + 3] == '"' &&
+          (j == 0 || tag[j - 1] == ' ' || tag[j - 1] == '\t' ||
+           tag[j - 1] == '\r' || tag[j - 1] == '\n')) {
+         const char* val = tag + j + 4;
+         const char* vend = memchr(val, '"', (size_t)(tag_end - val));
+         size_t id_len;
+         char* id;
+         if (!vend)
+            return NULL;
+         id_len = (size_t)(vend - val);
+         id = malloc(id_len + 1);
+         if (!id)
+            return NULL;
+         memcpy(id, val, id_len);
+         id[id_len] = '\0';
+         return id;
+      }
+   }
+   return NULL;
+}
+
 /**
  * @brief Extracts selected spectra from an MSZ compressed file and writes them as mzML.
+ * Output is wrapped in <indexedmzML> with a spectrum index of true absolute
+ * byte offsets and a PSI <fileChecksum>, unless the stored document already
+ * opens with <indexedmzML (mzML-path msz), in which case it passes through
+ * verbatim (see idxout_*).
  * @param input_map The memory-mapped MSZ input file buffer.
  * @param input_filesize The total size of the input file in bytes.
  * @param indicies Array of spectrum indices to extract (may be overridden by ms_level or scans).
@@ -1196,13 +1502,21 @@ void extract_msz(char* input_map, size_t input_filesize, long* indicies,
    size_t updated_header_len = 0;
    char* updated_header = update_spectrum_list_count(
        mzml_header, header_len, indicies_length, &updated_header_len);
-   if (updated_header) {
-      write_to_file(output_fd, updated_header, updated_header_len);
+
+   // All output goes through the index writer: it either wraps the document
+   // in <indexedmzML> and appends a true spectrum index (raw-path msz, bare
+   // <mzML> store) or passes an already-indexed source through verbatim.
+   idxout_t idxout;
+   const char* first_xml = updated_header ? updated_header : mzml_header;
+   size_t first_len =
+       updated_header ? updated_header_len : header_len;
+   if (idxout_begin(&idxout, output_fd, first_xml, first_len) != 0) {
+      error("extract_msz: Failed to initialize index output writer.\n");
       free(updated_header);
-   } else {
-      // Fallback: write original header
-      write_to_file(output_fd, mzml_header, header_len);
+      free(mzml_header);
+      return;
    }
+   free(updated_header);
    free(mzml_header);
 
    // Get spectra
@@ -1214,7 +1528,35 @@ void extract_msz(char* input_map, size_t input_filesize, long* indicies,
           msz_footer->mz_binary_pos, msz_footer->inten_binary_pos,
           msz_footer->mz_fmt, msz_footer->inten_fmt, divisions, indicies[i],
           &spectra_len);
-      write_to_file(output_fd, spectrum, spectra_len);
+      if (spectrum == NULL) {
+         error("extract_msz: Failed to extract spectrum index %ld.\n",
+               indicies[i]);
+         goto finish_output;
+      }
+
+      // Index the spectrum actually being emitted: its offset is the '<' of
+      // <spectrum (write any leading whitespace first so it stays exact).
+      size_t lead = 0;
+      char* spec_id = spectrum_id_from_chunk(spectrum, spectra_len, &lead);
+      if (spec_id == NULL) {
+         error("extract_msz: Spectrum index %ld has no parsable "
+               "<spectrum id=\"...\" attribute; cannot index.\n",
+               indicies[i]);
+         free(spectrum);
+         goto finish_output;
+      }
+      if (lead > 0 && idxout_write(&idxout, spectrum, lead) != 0) {
+         free(spec_id);
+         free(spectrum);
+         goto finish_output;
+      }
+      if (idxout_mark_spectrum(&idxout, spec_id) != 0) {
+         free(spec_id);
+         free(spectrum);
+         goto finish_output;
+      }
+      free(spec_id);
+      idxout_write(&idxout, spectrum + lead, spectra_len - lead);
       free(spectrum);
    }
 
@@ -1229,7 +1571,7 @@ void extract_msz(char* input_map, size_t input_filesize, long* indicies,
                                      xml_blk_offset, xml_blk_len);
       if (decmp_xml == NULL) {
          error("extract_msz: Failed to decompress XML block for mzML footer.\n");
-         return;
+         goto finish_output;
       }
       xml_blk_len->cache = decmp_xml;
    } else {
@@ -1237,8 +1579,11 @@ void extract_msz(char* input_map, size_t input_filesize, long* indicies,
    }
    char* mzml_footer = extract_mzml_footer(decmp_xml, divisions, &footer_len);
    // print("%s\n", mzml_footer);
-   write_to_file(output_fd, mzml_footer, footer_len);
+   idxout_write(&idxout, mzml_footer, footer_len);
    free(mzml_footer);
+
+finish_output:
+   idxout_finish(&idxout);
 
    // Free indicies if allocated by ms_level or scan mapping
    if (ms_level != 0 || scans_length > 0) {

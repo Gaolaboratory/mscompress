@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#include "../cli/sha1.h"
 #include "../vendor/zlib/zlib.h"
 #include "../vendor/zstd/lib/zstd.h"
 
@@ -471,6 +472,41 @@ void extract_mzml(char* input_map, divisions_t* divisions, int output_fd);
 void extract_msz(char* input_map, size_t input_filesize, long* indicies,
                  long indicies_length, uint32_t* scans, long scans_length,
                  uint16_t ms_level, int output_fd);
+
+/* extract.c — index-tracking output writer (idxout)
+ *
+ * Wraps the mzML stream emitted by extract_msz in <indexedmzML> and appends a
+ * spectrum <indexList> of true absolute byte offsets plus the PSI
+ * <fileChecksum> (SHA-1 over the bytes from <indexedmzML through </indexList>).
+ * Raw-path msz store a bare <mzML> document, so they are wrapped; mzML-path
+ * msz whose source document already opens with <indexedmzML pass through
+ * verbatim (wrap=0), and finish() only guarantees a trailing newline.
+ */
+typedef struct {
+   int fd;                    /* output */
+   uint64_t written;          /* bytes emitted so far */
+   int wrap;                  /* 1 = we are wrapping (raw-path), 0 = passthrough */
+   uint64_t* spec_offsets;    /* absolute byte offset of each '<' of <spectrum */
+   char** spec_ids;           /* malloc'd copies of the escaped id attr bytes */
+   size_t n_spec, cap_spec;
+   sha1_ctx sha;              /* running checksum from <indexedmzML through </indexList> */
+   int last_nl;               /* private: most recent byte written was '\n' */
+} idxout_t;
+
+int idxout_begin(idxout_t* io, int fd, const char* first_xml, size_t first_len);
+/* Writes "<?xml…?>\n<indexedmzML xmlns=…>\n" unless first_xml (after its own
+   <?xml…?> declaration) already starts with "<indexedmzML" — then
+   passthrough: emit first_xml verbatim, wrap=0. */
+int idxout_write(idxout_t* io, const void* buf, size_t len); /* counts + sha */
+int idxout_mark_spectrum(idxout_t* io, const char* escaped_id);
+/* records spec_offsets = written at the moment the caller is about to
+   emit '<' of "<spectrum "; call BEFORE idxout_write of that chunk. */
+int idxout_finish(idxout_t* io);
+/* wrap mode: appends indexList (one <offset idRef="ID">N</offset> per
+   spectrum, ids re-emitted verbatim/escaped-as-stored), updates sha over
+   it, emits <fileChecksum>HEX</fileChecksum></indexedmzML>\n. Passthrough:
+   no-op except ensuring the final byte written was '\n' (append one if
+   the stream didn't end with one). */
 
 void extract_mzml_filtered(char* input_map, size_t input_filesize,
                            long* indicies, long indicies_length,

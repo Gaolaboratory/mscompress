@@ -212,6 +212,9 @@ c_sources += get_all_c_files("../vendor/lz4/lib")
 c_sources += get_all_c_files("../vendor/zlib")
 c_sources += get_all_c_files("../src")
 c_sources += get_all_c_files("../src/algos")
+# src/extract.c (idxout extraction writer) links against the vendored SHA-1
+# for the PSI <fileChecksum>; it lives in cli/, not in the src/ glob.
+c_sources.append(_abs("../cli/sha1.c"))
 c_sources += get_all_c_files("../vendor/zstd")
 c_sources += get_all_c_files("../vendor/zstd/lib/common")
 c_sources += get_all_c_files("../vendor/zstd/lib/compress")

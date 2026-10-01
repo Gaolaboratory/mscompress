@@ -38,7 +38,10 @@ message("Include dirs are: ${dirs}")
 
 
 # Common source files
-file(GLOB SOURCE_FILES ${SRC_DIR}/*.c ${SRC_DIR}/algos/*.c *.cpp)
+# ../cli/sha1.c: vendored SHA-1 linked from src/extract.c (idxout extraction
+# writer emits the PSI <fileChecksum>); not part of the src/ glob.
+file(GLOB SOURCE_FILES ${SRC_DIR}/*.c ${SRC_DIR}/algos/*.c *.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/../cli/sha1.c)
 
 add_library(${PROJECT_NAME} SHARED ${SOURCE_FILES} ${CMAKE_JS_SRC})
 
