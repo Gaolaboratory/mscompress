@@ -420,8 +420,14 @@ static int mzml_write_spectrum(sink_t* s, const raw_spec_t* spec, uint64_t seq) 
          return -1;
    }
    /* Only claim a representation/polarity the reader actually established;
-    * a wrong cvParam is worse than none. */
-   if (spec->peak_mode == RAW_PEAKS_CENTROID) {
+    * a wrong cvParam is worse than none. Exception: a spectrum carrying a
+    * per-peak mobility array is a Bruker timsTOF frame — the m/z-sorted
+    * union of detector hits, i.e. peak-like data (the mobility values are
+    * not emitted here). Labelling it "profile" makes MSFragger and friends
+    * reject the file, so it is written as a centroid spectrum. The raw2ms
+    * CLI went the other way (it merges the hits with a real picker); that
+    * lives in the library, not the C ABI this reads. */
+   if (spec->peak_mode == RAW_PEAKS_CENTROID || spec->mobility != NULL) {
       if (sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1000127\" "
                          "name=\"centroid spectrum\" value=\"\"/>"))
          return -1;

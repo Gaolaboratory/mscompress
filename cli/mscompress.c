@@ -10,6 +10,11 @@
 #include <string.h>
 #include <sys/types.h>
 #include <time.h>
+#ifndef _WIN32
+#include <unistd.h> /* ftruncate */
+#else
+#include <io.h> /* _chsize */
+#endif
 
 #include "../vendor/zstd/lib/zstd.h"
 #include "libbase64.h"
@@ -18,6 +23,97 @@
 
 static const char* program_name = NULL;
 
+/* MSFragger 4.4.1+ only accepts an mzML whose </indexedmzML> sits on its own
+ * line: a newline immediately before the tag and one ending the file. mzML
+ * written by older raw2ms builds (and some other converters) glues the tag
+ * to the checksum element and to EOF. After decompressing, repair the tail
+ * on disk and tell the user what was changed. Best effort: on any anomaly
+ * the file is left exactly as decompressed. */
+static void fix_mzml_closing_tag(const char* path) {
+   static const char tag[] = "</indexedmzML>";
+   const size_t taglen = sizeof(tag) - 1;
+
+   if (!path) return;
+   FILE* f = fopen(path, "r+b");
+   if (!f) return;
+
+   long size;
+   if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < (long)taglen) {
+      fclose(f);
+      return;
+   }
+
+   char tail[64];
+   long start = size - (long)sizeof(tail);
+   if (start < 0) start = 0;
+   if (fseek(f, start, SEEK_SET) != 0) {
+      fclose(f);
+      return;
+   }
+   size_t got = fread(tail, 1, (size_t)(size - start), f);
+
+   /* the last occurrence in the tail is the document's closing tag */
+   char* hit = NULL;
+   for (char* p = tail + got - taglen; p >= tail; p--)
+      if (memcmp(p, tag, taglen) == 0) {
+         hit = p;
+         break;
+      }
+   if (!hit) { /* flat mzML (no indexed wrapper) or tag not at the end */
+      fclose(f);
+      return;
+   }
+   long tag_pos = start + (long)(hit - tail);
+
+   char prev = '\n';
+   if (hit > tail)
+      prev = hit[-1];
+   else if (start > 0) {
+      if (fseek(f, start - 1, SEEK_SET) != 0 || fread(&prev, 1, 1, f) != 1) {
+         fclose(f);
+         return;
+      }
+   }
+   long end_after = tag_pos + (long)taglen;
+   int need_before = start == 0 && tag_pos == 0 ? 0 : (prev != '\n');
+   int need_after = !(size == end_after + 1); /* must end tag + one '\n' */
+   if (!need_before && !need_after) {
+      fclose(f);
+      return;
+   }
+
+   if (fseek(f, tag_pos, SEEK_SET) != 0) {
+      fclose(f);
+      return;
+   }
+   if (need_before && fputc('\n', f) == EOF) {
+      fclose(f);
+      return;
+   }
+   if (fwrite(tag, 1, taglen, f) != taglen || fputc('\n', f) == EOF) {
+      fclose(f);
+      return;
+   }
+   long new_size = tag_pos + (need_before ? 1 : 0) + (long)taglen + 1;
+   fflush(f);
+#ifdef _WIN32
+   _chsize(_fileno(f), new_size);
+#else
+   ftruncate(fileno(f), new_size);
+#endif
+   fclose(f);
+
+   /* print() is gated on --verbose; this notice is for whoever decompressed
+    * the file, so it goes to stderr unconditionally (stdout may be
+    * redirected). */
+   fprintf(stderr,
+           "\tNote: the original mzML was not MSFragger 4.4.1+ compatible\n"
+           "\t(</indexedmzML> was not on its own line); added the missing\n"
+           "\tnewline%s so the tag ends the file on its own line.\n",
+           need_before && need_after ? "s" : "");
+}
+
+
 /* --run-index: which run of a multi-run vendor container (.wiff) to
  * convert. Lives here rather than in Arguments to keep the shared struct
  * untouched. */
@@ -25,6 +121,25 @@ static uint64_t run_index_arg = 0;
 
 /* --salvage: skip unreadable spectra in vendor input instead of failing. */
 static int salvage_arg = 0;
+/* Set by compress_raw when raw2ms recovered a corrupt vendor file. */
+static int raw_recovered = 0;
+
+/* `x.msz` -> `x_recovered.msz`; NULL when `path` does not end in ".msz"
+ * (an explicit name the caller chose for its own reasons, such as a
+ * pipeline's temporary `.part` file, is left alone). */
+static char* recovered_name(const char* path) {
+   size_t n = strlen(path);
+   if (n < 4 || strcmp(path + n - 4, ".msz") != 0)
+      return NULL;
+   const char* tag = "_recovered";
+   char* out = malloc(n + strlen(tag) + 1);
+   if (out == NULL)
+      return NULL;
+   memcpy(out, path, n - 4);
+   strcpy(out + n - 4, tag);
+   strcat(out, ".msz");
+   return out;
+}
 
 /* Vendor raw input operation; local to the CLI (src/ operations run 1-7). */
 #define COMPRESS_RAW 8
@@ -71,7 +186,10 @@ static void print_usage(FILE* stream, int exit_code) {
            "vendor file (SCIEX .wiff). (default: 0)\n");
    fprintf(stream,
            " --salvage                      Skip unreadable spectra in vendor "
-           "files instead of failing. (disabled by default)\n");
+           "files instead of failing, and recover as much as possible from "
+           "a corrupt Thermo .raw (truncated, zero-filled or with shifted "
+           "data blocks). No quality is guaranteed; a recovered file is "
+           "written as <name>_recovered.msz. (disabled by default)\n");
    fprintf(stream,
            " --target-xml-format type       Set target xml compression format "
            "(zstd, none). (default: zstd)\n");
@@ -438,6 +556,7 @@ int main(int argc, char* argv[]) {
             error_status = 1;
             break;
          }
+         fix_mzml_closing_tag(arguments.output_file);
 
          break;
       };
@@ -476,7 +595,7 @@ int main(int argc, char* argv[]) {
 
          if (compress_raw(arguments.input_file, run_index_arg, salvage_arg,
                           &arguments,
-                          local_fds[1])) {
+                          local_fds[1], &raw_recovered)) {
             error_status = 1;
             break;
          }
@@ -523,6 +642,22 @@ int main(int argc, char* argv[]) {
    if (error_status) {
       remove_file(arguments.output_file);
       exit(1);
+   }
+
+   // A recovered file must not pass for a clean conversion: name it so.
+   if (raw_recovered) {
+      char* named = recovered_name(arguments.output_file);
+      if (named == NULL) {
+         warning("Output %s was recovered from a corrupt file but is not "
+                 "named *_recovered.msz (not an .msz path).\n",
+                 arguments.output_file);
+      } else if (rename(arguments.output_file, named) != 0) {
+         error("Cannot rename %s to %s (%s).\n", arguments.output_file, named,
+               strerror(errno));
+         exit(1);
+      } else {
+         print("\tRecovered output: %s\n", named);
+      }
    }
 
    exit(0);
