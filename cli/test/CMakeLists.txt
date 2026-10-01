@@ -2,6 +2,12 @@
 
 set(TEST_DATA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../test/data)
 
+# The end-to-end extraction gate (test_extract_index.py) needs a Python 3
+# interpreter. It always runs the repo-fixture mzML leg; the vendor raw leg
+# only activates when MSC_RAW_FIXTURE and RAW2MS_LIBRARY are set in the
+# environment at ctest time (same self-skipping pattern as RawCompressTest).
+find_package(Python3 COMPONENTS Interpreter)
+
 # Unit tests for the vendor raw -> mzML writer. Runs without libraw2ms:
 # spectra are synthesized and checked against mscompress's own detectors.
 file(GLOB RAW_WRITER_CORE_SOURCES ${SRC_DIR}/*.c ${SRC_DIR}/algos/*.c)
@@ -255,3 +261,19 @@ add_test(NAME RawCompressTest
     -DTEMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/tmp_raw
     -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test_raw.cmake
 )
+
+# End-to-end extraction gate: mzML -> msz -> --extract must yield a
+# newline-terminated indexedmzML whose spectrum index really lands on
+# <spectrum elements (plus isolation-window/peak-mode/pyteomics checks on
+# the vendor raw path). The raw leg self-skips unless MSC_RAW_FIXTURE and
+# RAW2MS_LIBRARY are set in the environment when ctest runs.
+if(Python3_Interpreter_FOUND)
+    add_test(NAME ExtractIndexTest
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test_extract_index.py
+                $<TARGET_FILE:mscompress>
+                ${CMAKE_CURRENT_BINARY_DIR}/tmp_extract_index
+    )
+else()
+    message(STATUS "ExtractIndexTest skipped: no Python 3 interpreter found")
+endif()
