@@ -10,6 +10,7 @@
  */
 
 #include "../raw_input.h"
+#include "../sha1.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -727,6 +728,23 @@ static void test_is_raw_vendor_path(void) {
    CHECK(is_raw_vendor_path(NULL) == 0, "NULL path is not raw");
 }
 
+/* --- vendored SHA-1 -------------------------------------------------------- */
+
+/* Vectors cross-checked against python hashlib and coreutils sha1sum. */
+static void test_sha1_vectors(void) {
+   char hex[41];
+   sha1_hex("abc", 3, hex);
+   CHECK(strcmp(hex, "a9993e364706816aba3e25717850c26c9cd0d89d") == 0, "sha1 abc");
+   sha1_hex("", 0, hex);
+   CHECK(strcmp(hex, "da39a3ee5e6b4b0d3255bfef95601890afd80709") == 0, "sha1 empty");
+   /* >64-byte input exercises the block loop: "abc" repeated 64 times. */
+   char buf[192];
+   for (int i = 0; i < 64; i++)
+      memcpy(buf + i * 3, "abc", 3);
+   sha1_hex(buf, 192, hex);
+   CHECK(strcmp(hex, "c8d58115d6878bdade7e3f3ab1a202cd771a0ee4") == 0, "sha1 192B");
+}
+
 int main(void) {
    RUN_TEST(test_pattern_detect_reads_generated_mzml);
    RUN_TEST(test_scan_mzml_locates_spectra_and_binaries);
@@ -746,6 +764,7 @@ int main(void) {
    RUN_TEST(test_estimate_formula);
    RUN_TEST(test_should_chunk_boundary);
    RUN_TEST(test_is_raw_vendor_path);
+   RUN_TEST(test_sha1_vectors);
 
    printf("%d checks, %d failures\n", checks, failures);
    return failures ? 1 : 0;

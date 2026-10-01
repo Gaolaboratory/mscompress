@@ -6,7 +6,7 @@ set(TEST_DATA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../test/data)
 # spectra are synthesized and checked against mscompress's own detectors.
 file(GLOB RAW_WRITER_CORE_SOURCES ${SRC_DIR}/*.c ${SRC_DIR}/algos/*.c)
 add_executable(test_raw_writer test_raw_writer.c ${RAW_WRITER_CORE_SOURCES}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../raw_input.c)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../raw_input.c ${CMAKE_CURRENT_SOURCE_DIR}/../sha1.c)
 target_include_directories(test_raw_writer PUBLIC
     ${VENDOR_DIR}/zstd/lib
     ${VENDOR_DIR}/base64/include
