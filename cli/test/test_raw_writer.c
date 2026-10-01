@@ -123,6 +123,7 @@ static void build_run(raw_run_t* run) {
    run->instrument_model = "Test Instrument X";
    run->raw2ms_version = "0.1.0";
    run->vendor = RAW_VENDOR_THERMO;
+   run->recovery = NULL;
 }
 
 /* Writes the synthetic run and bails the test early if that fails. */
@@ -413,6 +414,46 @@ static void test_mzml_is_well_formed_xml(void) {
    free(doc.buf);
 }
 
+/* A run raw2ms recovered from a corrupt file: a spectrum whose retention
+ * time was lost carries no scan start time (neither 0 nor "nan" is one),
+ * and the document says it was recovered, in well-formed XML. */
+static void test_recovered_run_omits_lost_times_and_says_so(void) {
+   raw_run_t run;
+   build_run(&run);
+   run.recovery = "corrupt file, no scan index: 3 scan packets <recovered>";
+   g_specs[1].rt_seconds = NAN;
+   mzml_buf_t doc;
+   if (raw_write_mzml_mem(&run, 0, &doc) != 0) {
+      fprintf(stderr, "FAIL: raw_write_mzml_mem error\n");
+      failures++;
+      return;
+   }
+   CHECK(strstr(doc.buf, "raw2ms recovered from a corrupt file") != NULL,
+         "the recovery note is in fileContent");
+   CHECK(strstr(doc.buf, "3 scan packets &lt;recovered&gt;") != NULL,
+         "the note is attribute-escaped");
+   CHECK(strstr(doc.buf, "nan") == NULL && strstr(doc.buf, "NaN") == NULL,
+         "no NaN reaches the document");
+   const char* s2 = strstr(doc.buf, "index=\"1\"");
+   const char* s3 = s2 ? strstr(s2, "index=\"2\"") : NULL;
+   const char* stt = s2 ? strstr(s2, "scan start time") : NULL;
+   CHECK(s2 && s3 && (stt == NULL || stt > s3),
+         "the spectrum with a lost time has no scan start time");
+   CHECK(strstr(doc.buf, "scan start time") != NULL,
+         "spectra that kept their time still carry it");
+   yxml_t* xml = alloc_yxml();
+   int bad = 0;
+   for (size_t i = 0; i < doc.len; i++) {
+      if (yxml_parse(xml, doc.buf[i]) < 0) {
+         bad = 1;
+         break;
+      }
+   }
+   CHECK(!bad, "the recovered document is well-formed XML");
+   free(xml);
+   free(doc.buf);
+}
+
 static void test_fd_writer_matches_memory_writer(void) {
    mzml_buf_t doc;
    if (write_doc(&doc))
@@ -652,6 +693,7 @@ int main(void) {
    RUN_TEST(test_metadata_and_escaping);
    RUN_TEST(test_native_id_format_cvparam_per_vendor);
    RUN_TEST(test_mzml_is_well_formed_xml);
+   RUN_TEST(test_recovered_run_omits_lost_times_and_says_so);
    RUN_TEST(test_fd_writer_matches_memory_writer);
    RUN_TEST(test_generated_mzml_compresses_via_pipeline);
    RUN_TEST(test_fetch_failure_is_fatal_without_salvage);
