@@ -26,7 +26,9 @@
  * @param zblk A `zlib_block_t` struct with `zblk->buff` populated as the source buffer.
  * @param dest Pre-allocated destination buffer for the base64-encoded output.
  * @param src_len Length of the data in `zblk->buff` to encode.
- * @param out_len Pointer to a variable that receives the length of the base64 output.
+ * @param out_len In: capacity of `dest` in bytes. Out: length of the base64
+ *                output. If the output would not fit, nothing is written and
+ *                `*out_len` is set to the required size (> the capacity passed).
  * @warning This function frees the `zlib_block_t*` `zblk` parameter internally.
  *          The caller must not free `zblk` after calling this function.
  */
@@ -49,6 +51,13 @@ void encode_base64(zlib_block_t* zblk, char* dest, size_t src_len,
 
    // b64_out_buff = malloc(sizeof(char)*src_len*2);
 
+   size_t needed = 4 * ((src_len + 2) / 3);  // padded base64 length
+   if (needed > *out_len) {
+      *out_len = needed;
+      free(zblk);
+      return;
+   }
+
    base64_encode(zblk->buff, src_len, dest, out_len, 0);
 
    // zlib_dealloc(zblk);
@@ -64,7 +73,8 @@ void encode_base64(zlib_block_t* zblk, char* dest, size_t src_len,
  * @param src Pointer to a char pointer referencing the source data. Advanced by `src_len` on return.
  * @param src_len Length of the source data to compress.
  * @param dest Pre-allocated destination buffer for the base64-encoded output.
- * @param out_len Pointer to a variable that receives the length of the base64 output.
+ * @param out_len In: capacity of `dest`. Out: length of the base64 output, or
+ *                the required size if it exceeds the capacity (see `encode_base64()`).
  * @note The src pointer `(*src)` is advanced by `src_len` after encoding.
  */
 void encode_zlib_fun_no_header(z_stream* z, char** src, size_t src_len,
@@ -88,13 +98,7 @@ void encode_zlib_fun_no_header(z_stream* z, char** src, size_t src_len,
 
    size_t zlib_len = 0;
 
-   zlib_block_t* decmp_input;
-
    zlib_block_t* cmp_output;
-
-   decmp_input = zlib_alloc(0);
-   decmp_input->mem = *src;
-   decmp_input->buff = decmp_input->mem + decmp_input->offset;
 
    cmp_output = zlib_alloc(0);
 
@@ -105,8 +109,8 @@ void encode_zlib_fun_no_header(z_stream* z, char** src, size_t src_len,
    zlib_len = (size_t)zlib_compress(z, ((Bytef*)*src), cmp_output, src_len);
    if (zlib_len == 0) {
       error("encode_zlib_fun: zlib_compress error\n");
-      free(decmp_input);
-      free(cmp_output);
+      zlib_dealloc(cmp_output);
+      *out_len = 0;
       // Continue to move forward
       *src += src_len;
       return;
@@ -114,10 +118,10 @@ void encode_zlib_fun_no_header(z_stream* z, char** src, size_t src_len,
    // zlib_len = (size_t)zlib_compress(((Bytef*)*src) + ZLIB_SIZE_OFFSET,
    // cmp_output, src_len);
 
-   free(decmp_input);
-   // free(decmp_header);
-
+   // encode_base64 frees the cmp_output struct but not its buffer
+   char* cmp_mem = cmp_output->mem;
    encode_base64(cmp_output, dest, zlib_len, out_len);
+   free(cmp_mem);
 
    *src += src_len;
 }
@@ -130,7 +134,8 @@ void encode_zlib_fun_no_header(z_stream* z, char** src, size_t src_len,
  *            Advanced by `(ZLIB_SIZE_OFFSET + original data length)` on return.
  * @param src_len Length of the source data including the header.
  * @param dest Pre-allocated destination buffer for the base64-encoded output.
- * @param out_len Pointer to a variable that receives the length of the base64 output.
+ * @param out_len In: capacity of `dest`. Out: length of the base64 output, or
+ *                the required size if it exceeds the capacity (see `encode_base64()`).
  * @note The source data is expected to have a `ZLIB_SIZE_OFFSET`-byte header containing
  *       the original uncompressed data length. The header is read via `zlib_pop_header()`
  *       and freed internally. The src pointer `(*src)` is advanced past header + data.
@@ -179,7 +184,8 @@ void encode_zlib_fun_w_header(z_stream* z, char** src, size_t src_len,
       error("encode_zlib_fun: zlib_compress error\n");
       free(decmp_input);
       free(decmp_header);
-      free(cmp_output);
+      zlib_dealloc(cmp_output);
+      *out_len = 0;
       // Continue to move forward
       *src += org_len + ZLIB_SIZE_OFFSET;
       return;
@@ -188,7 +194,10 @@ void encode_zlib_fun_w_header(z_stream* z, char** src, size_t src_len,
    free(decmp_input);
    free(decmp_header);
 
+   // encode_base64 frees the cmp_output struct but not its buffer
+   char* cmp_mem = cmp_output->mem;
    encode_base64(cmp_output, dest, zlib_len, out_len);
+   free(cmp_mem);
 
    *src += (ZLIB_SIZE_OFFSET + org_len);
 }
@@ -201,7 +210,8 @@ void encode_zlib_fun_w_header(z_stream* z, char** src, size_t src_len,
  *            Advanced by (`ZLIB_SIZE_OFFSET` + original data length) on return.
  * @param src_len Length of the source data including the header.
  * @param dest Pre-allocated destination buffer for the base64-encoded output.
- * @param out_len Pointer to a variable that receives the length of the base64 output.
+ * @param out_len In: capacity of `dest`. Out: length of the base64 output, or
+ *                the required size if it exceeds the capacity (see `encode_base64()`).
  * @note The source data header (`ZLIB_SIZE_OFFSET` bytes) stores the original data length.
  *       The header is extracted via `zlib_pop_header()` and freed internally.
  *       The src pointer `(*src)` is advanced past header + data.
@@ -252,7 +262,8 @@ void encode_no_comp_fun_w_header(z_stream* z, char** src, size_t src_len,
  * @param src Pointer to a char pointer referencing the source data.
  * @param src_len Length of the source data to encode.
  * @param dest Pre-allocated destination buffer for the base64-encoded output.
- * @param out_len Pointer to a variable that receives the length of the base64 output.
+ * @param out_len In: capacity of `dest`. Out: length of the base64 output, or
+ *                the required size if it exceeds the capacity (see `encode_base64()`).
  * @note The src pointer `(*src)` is NOT advanced by this function.
  * @note The intermediate `zlib_block_t` wrapping the source data is freed inside
  *       `encode_base64()`.
@@ -300,7 +311,9 @@ void encode_no_comp_fun_no_header(z_stream* z, char** src, size_t src_len,
  * @param src_len Length of the source data including the header (unused; actual length
  *                is read from the header).
  * @param dest Pre-allocated destination buffer to receive the raw binary data.
- * @param out_len Pointer to a variable that receives the number of bytes copied.
+ * @param out_len In: capacity of `dest` in bytes. Out: number of bytes copied.
+ *                If the data would not fit, nothing is copied and `*out_len`
+ *                is set to the required size (> the capacity passed).
  * @note The source data header (`ZLIB_SIZE_OFFSET` bytes) stores the original data length.
  *       The header is extracted via `zlib_pop_header()` and freed internally.
  *       The src pointer `(*src)` is advanced past header + data.
@@ -317,9 +330,9 @@ void no_encode_w_header(z_stream* z, char** src, size_t src_len, char* dest,
    ZLIB_TYPE org_len = *(ZLIB_TYPE*)header;
    free(header);
 
+   if (org_len <= *out_len)
+      memcpy(dest, decmp_input->buff, org_len);
    *out_len = org_len;
-
-   memcpy(dest, decmp_input->buff, org_len);
 
    free(decmp_input);
    *src += org_len + ZLIB_SIZE_OFFSET;
