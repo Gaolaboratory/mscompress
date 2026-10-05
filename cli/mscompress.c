@@ -141,29 +141,6 @@ static char* recovered_name(const char* path) {
    return out;
 }
 
-/* Expands a --extract-scans spec ("3", "3,9", "2-5", "[1-3,5-6]") into the
- * uint32_t scan array Arguments.scans holds. string_to_array() expands the
- * same spec into longs, so the values are narrowed element by element here:
- * reinterpreting its long* buffer as uint32_t* would make every other read
- * pick up the upper half of a long instead of the next scan ("3,9" yielded
- * {3, 0}, extracting only scan 3). */
-static uint32_t* string_to_scans(char* str, long* size) {
-   long* expanded = string_to_array(str, size);
-   long n = *size;
-
-   uint32_t* scans = malloc((n > 0 ? n : 1) * sizeof(uint32_t));
-   if (scans == NULL) {
-      error("Unable to allocate scan array.\n");
-      exit(1);
-   }
-
-   for (long i = 0; i < n; i++)
-      scans[i] = (uint32_t)expanded[i];
-
-   free(expanded);
-   return scans;
-}
-
 /* Vendor raw input operation; local to the CLI (src/ operations run 1-7). */
 #define COMPRESS_RAW 8
 
@@ -343,7 +320,9 @@ static int parse_arguments(int argc, char* argv[], Arguments* arguments) {
             return 1;
          }
          arguments->scans =
-             string_to_scans(argv[++i], &arguments->scans_length);
+             string_to_scan_array(argv[++i], &arguments->scans_length);
+         if (!arguments->scans)
+            return 1;
       } else if (strcmp(argv[i], "--ms-level") == 0) {
          if (i + 1 >= argc) {
             fprintf(stderr, "%s\n", "Missing ms level for extraction.");
