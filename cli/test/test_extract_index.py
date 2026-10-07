@@ -291,7 +291,10 @@ def leg_raw(mscompress, workdir):
     raw_lib = os.environ.get("RAW2MS_LIBRARY")
     if not check("leg 2: RAW2MS_LIBRARY is set", bool(raw_lib)):
         return
-    if not check("leg 2: raw fixture exists", os.path.isfile(fixture), fixture):
+    # A vendor raw is a file (Thermo .raw, SCIEX .wiff/.wiff2/.t2d) or a
+    # directory (Bruker .d, Waters .raw); isfile() alone refused every .d.
+    if not check("leg 2: raw fixture exists",
+                 os.path.isfile(fixture) or os.path.isdir(fixture), fixture):
         return
     if not check("leg 2: RAW2MS_LIBRARY file exists",
                  os.path.isfile(raw_lib), raw_lib):
