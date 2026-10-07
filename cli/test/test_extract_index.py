@@ -163,8 +163,19 @@ def check_fresh_index(tag, data, offsets, expected_count):
               % (ilo.group(1).decode(), data.index(b"<indexList")))
 
 
+def has_msn(data):
+    """Whether any spectrum is MS2 or deeper. An MS1-only run (a TSF MALDI
+    imaging run, a survey-only file) has no isolation windows or precursors
+    to check."""
+    return any(int(v) >= 2 for v in
+               re.findall(rb'name="ms level" value="([0-9]+)"', data))
+
+
 def check_isolation_windows(tag, data):
     """T1 window rules over every isolationWindow in the document."""
+    if not has_msn(data):
+        info("%s: MS1-only document: isolation-window checks not applicable" % tag)
+        return
     blocks = re.findall(rb"<isolationWindow>(.*?)</isolationWindow>", data, re.S)
     if not check("%s: isolation windows present" % tag, len(blocks) > 0):
         return
@@ -209,14 +220,26 @@ def check_peak_mode_and_dia(tag, data, n_body_spectra):
           centroid + profile == n_body_spectra,
           "%d centroid + %d profile vs %d spectra"
           % (centroid, profile, n_body_spectra))
+    if not has_msn(data):
+        info("%s: MS1-only document: precursor checks not applicable" % tag)
+        return
     precursors = re.findall(rb"<precursorList.*?</precursorList>", data, re.S)
     if check("%s: precursorList elements present" % tag, len(precursors) > 0):
-        bad = sum(1 for p in precursors
-                  if p.count(b"<isolationWindow>") != 1
-                  or b"selectedIonList" not in p
-                  or SELECTED_ION_MZ not in p)
-        check("%s: every precursor has one window + selected ion m/z" % tag,
-              bad == 0, "%d of %d precursors incomplete" % (bad, len(precursors)))
+        bad_window = sum(1 for p in precursors if p.count(b"<isolationWindow>") != 1)
+        check("%s: every precursor has exactly one isolation window" % tag,
+              bad_window == 0, "%d of %d precursors" % (bad_window, len(precursors)))
+        # DDA selects one ion per precursor; DIA (diaPASEF, SWATH) isolates a
+        # window and selects none. Decided per document, so a DDA run that
+        # loses a selected ion still fails here.
+        with_ion = sum(1 for p in precursors
+                       if b"selectedIonList" in p and SELECTED_ION_MZ in p)
+        if with_ion == 0:
+            info("%s: no selected ions: DIA document, windows only" % tag)
+        else:
+            check("%s: every precursor has a selected ion m/z (DDA)" % tag,
+                  with_ion == len(precursors),
+                  "%d of %d precursors lack one" % (len(precursors) - with_ion,
+                                                   len(precursors)))
 
 
 def pyteomics_count(path):
@@ -327,20 +350,37 @@ def leg_raw(mscompress, workdir):
         check_isolation_windows("leg 2 full", data)
         check_peak_mode_and_dia("leg 2 full", data, n_body)
 
-    # Filtered extraction mirrors the manual smoke: --extract-scans 2-25.
-    if run(mscompress, ["--extract", "--extract-scans", "2-25", msz, filtered],
-           name="raw extract scans 2-25") is None:
+    # Filtered extraction mirrors the manual smoke: --extract-scans 2-25 —
+    # where scan numbers mean that. timsTOF ids are "frame=N scan=M" with M a
+    # mobility scan, SCIEX ids count cycles, so a scan range selects nothing
+    # meaningful there; those fixtures select by position instead.
+    scan_ids = bool(idrefs) and all(
+        b"scan=" in i and b"frame=" not in i for i in idrefs)
+    if scan_ids:
+        sel, how = ["--extract-scans", "2-25"], "scans 2-25"
+    else:
+        sel, how = ["--extract-indices", "1-24"], "indices 1-24"
+    if run(mscompress, ["--extract"] + sel + [msz, filtered],
+           name="raw extract %s" % how) is None:
         return
     with open(filtered, "rb") as f:
         fdata = f.read()
     fn_body = fdata.count(b"<spectrum ")
+    check("leg 2 filtered: the %s selection matched spectra" % how, fn_body > 0,
+          "extracted an empty document")
     fidrefs, foffsets = common_document_checks("leg 2 filtered", fdata, fn_body)
     if foffsets:
         check_fresh_index("leg 2 filtered", fdata, foffsets, fn_body)
-        wanted = [s for s in range(2, 26) if s in set(scan_numbers(idrefs or []))]
-        check("leg 2 filtered: exactly scans 2-25 extracted",
-              sorted(scan_numbers(fidrefs)) == wanted,
-              "got %s, expected %s" % (sorted(scan_numbers(fidrefs))[:8], wanted[:8]))
+        if scan_ids:
+            wanted = [s for s in range(2, 26) if s in set(scan_numbers(idrefs or []))]
+            check("leg 2 filtered: exactly scans 2-25 extracted",
+                  sorted(scan_numbers(fidrefs)) == wanted,
+                  "got %s, expected %s" % (sorted(scan_numbers(fidrefs))[:8], wanted[:8]))
+        else:
+            wanted = list((idrefs or [])[1:25])
+            check("leg 2 filtered: exactly indices 1-24 extracted",
+                  list(fidrefs) == wanted,
+                  "got %s, expected %s" % (list(fidrefs)[:3], wanted[:3]))
         check_isolation_windows("leg 2 filtered", fdata)
         check_peak_mode_and_dia("leg 2 filtered", fdata, fn_body)
 
