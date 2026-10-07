@@ -521,14 +521,31 @@ static int mzml_write_spectrum(sink_t* s, const raw_spec_t* spec, uint64_t seq) 
    if (has_precursor) {
       if (sink_printf(s, "<precursorList count=\"1\"><precursor>"))
          return -1;
+      /* The ABI reports absolute window bounds; mzML wants a target and
+       * offsets. With a selected ion the target is that ion. A DIA window
+       * (diaPASEF, SWATH) has bounds but no single ion and a NaN
+       * precursor_mz; the ABI carries no target, so the window is centred
+       * on its bounds — raw2ms defines such windows as target ± width/2 —
+       * instead of being dropped, and no selected ion is invented. */
+      int has_window = 0;
+      double target = 0.0, lower = 0.0, upper = 0.0;
       if (!is_nan(spec->precursor_mz)) {
-         /* The ABI reports absolute window bounds; mzML wants offsets. */
-         double lower = is_nan(spec->isolation_lower)
-                            ? 0.0
-                            : fabs(spec->precursor_mz - spec->isolation_lower);
-         double upper = is_nan(spec->isolation_upper)
-                            ? 0.0
-                            : fabs(spec->isolation_upper - spec->precursor_mz);
+         has_window = 1;
+         target = spec->precursor_mz;
+         lower = is_nan(spec->isolation_lower)
+                     ? 0.0
+                     : fabs(spec->precursor_mz - spec->isolation_lower);
+         upper = is_nan(spec->isolation_upper)
+                     ? 0.0
+                     : fabs(spec->isolation_upper - spec->precursor_mz);
+      } else if (!is_nan(spec->isolation_lower) &&
+                 !is_nan(spec->isolation_upper)) {
+         has_window = 1;
+         target = (spec->isolation_lower + spec->isolation_upper) / 2.0;
+         lower = target - spec->isolation_lower;
+         upper = spec->isolation_upper - target;
+      }
+      if (has_window) {
          if (sink_printf(s, "<isolationWindow>"
                             "<cvParam cvRef=\"MS\" accession=\"MS:1000827\" "
                             "name=\"isolation window target m/z\" value=\"%.6f\" "
@@ -543,7 +560,7 @@ static int mzml_write_spectrum(sink_t* s, const raw_spec_t* spec, uint64_t seq) 
                             "value=\"%.6f\" unitCvRef=\"MS\" "
                             "unitAccession=\"MS:1000040\" unitName=\"m/z\"/>"
                             "</isolationWindow>",
-                         spec->precursor_mz, lower, upper))
+                         target, lower, upper))
             return -1;
       }
       if (!is_nan(spec->precursor_mz)) {

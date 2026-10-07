@@ -497,6 +497,50 @@ static void test_recovered_run_omits_lost_times_and_says_so(void) {
    free(doc.buf);
 }
 
+/* diaPASEF-style MS2: an isolation window but no single selected ion. The
+ * ABI reports only the absolute bounds (no target) and a NaN precursor_mz;
+ * the window must still be written, centred on the bounds, with no
+ * selectedIon invented for it. */
+static void test_dia_window_without_selected_ion(void) {
+   raw_run_t run;
+   build_run(&run);
+   g_specs[1].precursor_mz = NAN;
+   g_specs[1].isolation_lower = 600.0;
+   g_specs[1].isolation_upper = 625.0;
+   g_specs[1].precursor_id = -1;
+   g_specs[1].charge = -1;
+   mzml_buf_t doc;
+   if (raw_write_mzml_mem(&run, 0, &doc) != 0) {
+      fprintf(stderr, "FAIL: raw_write_mzml_mem error\n");
+      failures++;
+      return;
+   }
+   const char* s2 = strstr(doc.buf, "index=\"1\"");
+   const char* s3 = s2 ? strstr(s2, "index=\"2\"") : NULL;
+   const char* win = s2 ? strstr(s2, "<isolationWindow>") : NULL;
+   CHECK(s2 && s3 && win && win < s3, "the DIA spectrum carries an isolationWindow");
+   CHECK(strstr(doc.buf, "name=\"isolation window target m/z\" value=\"612.500000\"") != NULL,
+         "the window target is the midpoint of its bounds");
+   CHECK(strstr(doc.buf, "name=\"isolation window lower offset\" value=\"12.500000\"") != NULL &&
+         strstr(doc.buf, "name=\"isolation window upper offset\" value=\"12.500000\"") != NULL,
+         "the offsets are half the window each");
+   CHECK(strstr(doc.buf, "<selectedIon>") == NULL,
+         "no selected ion is invented for a DIA window");
+   CHECK(strstr(doc.buf, "nan") == NULL && strstr(doc.buf, "NaN") == NULL,
+         "no NaN reaches the document");
+   yxml_t* xml = alloc_yxml();
+   int bad = 0;
+   for (size_t i = 0; i < doc.len; i++) {
+      if (yxml_parse(xml, doc.buf[i]) < 0) {
+         bad = 1;
+         break;
+      }
+   }
+   CHECK(!bad, "the DIA document is well-formed XML");
+   free(xml);
+   free(doc.buf);
+}
+
 static void test_fd_writer_matches_memory_writer(void) {
    mzml_buf_t doc;
    if (write_doc(&doc))
@@ -755,6 +799,7 @@ int main(void) {
    RUN_TEST(test_native_id_format_cvparam_per_vendor);
    RUN_TEST(test_mzml_is_well_formed_xml);
    RUN_TEST(test_recovered_run_omits_lost_times_and_says_so);
+   RUN_TEST(test_dia_window_without_selected_ion);
    RUN_TEST(test_fd_writer_matches_memory_writer);
    RUN_TEST(test_generated_mzml_compresses_via_pipeline);
    RUN_TEST(test_fetch_failure_is_fatal_without_salvage);
