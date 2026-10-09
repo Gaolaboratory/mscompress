@@ -65,6 +65,27 @@ typedef struct {
 } raw_spec_t;
 
 /**
+ * @brief A spectrum's own precursor stage.
+ *
+ * Mirrors Raw2msPrecursor in the raw2ms C ABI (raw2ms_spectrum_precursor)
+ * field-for-field -- keep in step. It carries what raw_spec_t cannot: the
+ * isolation *target* (the window centre the quadrupole was set to), which
+ * differs from the selected ion on a large minority of Thermo DDA scans
+ * (monoisotopic correction) and is what mzML's MS:1000827 means.
+ */
+typedef struct {
+   double mz;                /* selected ion; NaN when no single ion */
+   double isolation_target;  /* NaN when unrecorded, as are the edges */
+   double isolation_lower;
+   double isolation_upper;
+   double collision_energy;  /* eV; NaN when unrecorded */
+   int64_t parent_index;     /* -1 when absent */
+   int64_t precursor_id;     /* -1 when absent */
+   int32_t charge;           /* -1 when absent */
+   int32_t activation;       /* RAW2MS_ACTIVATION_*; 0 unknown */
+} raw_prec_t;
+
+/**
  * @brief Spectra are pulled one at a time so neither the in-memory nor the
  *        chunked sink ever holds more than one spectrum's mzML text.
  */
@@ -75,6 +96,11 @@ typedef struct {
    /* Detail for the most recent failed fetch (provider-specific), or NULL.
     * May be NULL itself when a provider has nothing to add. */
    const char* (*last_error)(void* ctx);
+   /* Optional: fill `out` with `spec`'s own precursor stage and return 0, or
+    * nonzero when the spectrum has none or the provider cannot say. NULL
+    * when the provider has no such notion; the writer then centres the
+    * window on the selected ion. */
+   int (*precursor)(void* ctx, const raw_spec_t* spec, raw_prec_t* out);
 } raw_provider_t;
 
 /**

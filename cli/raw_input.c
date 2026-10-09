@@ -393,7 +393,8 @@ static int mzml_write_header(sink_t* s, const raw_run_t* run, uint64_t count) {
    return 0;
 }
 
-static int mzml_write_spectrum(sink_t* s, const raw_spec_t* spec, uint64_t seq) {
+static int mzml_write_spectrum(sink_t* s, const raw_provider_t* prov,
+                               const raw_spec_t* spec, uint64_t seq) {
    uint64_t n = spec->n_peaks;
    char idbuf[64];
 
@@ -522,45 +523,54 @@ static int mzml_write_spectrum(sink_t* s, const raw_spec_t* spec, uint64_t seq) 
       if (sink_printf(s, "<precursorList count=\"1\"><precursor>"))
          return -1;
       /* The ABI reports absolute window bounds; mzML wants a target and
-       * offsets. With a selected ion the target is that ion. A DIA window
-       * (diaPASEF, SWATH) has bounds but no single ion and a NaN
-       * precursor_mz; the ABI carries no target, so the window is centred
-       * on its bounds — raw2ms defines such windows as target ± width/2 —
-       * instead of being dropped, and no selected ion is invented. */
-      int has_window = 0;
-      double target = 0.0, lower = 0.0, upper = 0.0;
-      if (!is_nan(spec->precursor_mz)) {
-         has_window = 1;
-         target = spec->precursor_mz;
-         lower = is_nan(spec->isolation_lower)
-                     ? 0.0
-                     : fabs(spec->precursor_mz - spec->isolation_lower);
-         upper = is_nan(spec->isolation_upper)
-                     ? 0.0
-                     : fabs(spec->isolation_upper - spec->precursor_mz);
-      } else if (!is_nan(spec->isolation_lower) &&
-                 !is_nan(spec->isolation_upper)) {
-         has_window = 1;
-         target = (spec->isolation_lower + spec->isolation_upper) / 2.0;
-         lower = target - spec->isolation_lower;
-         upper = spec->isolation_upper - target;
+       * offsets. The target is the isolation stage's own when the library
+       * exposes it (raw2ms_spectrum_precursor) -- the window centre, which on
+       * a Thermo DDA scan with monoisotopic correction is NOT the selected
+       * ion; otherwise the selected ion stands in, and a DIA window
+       * (diaPASEF, SWATH: bounds but no single ion) is centred on its
+       * bounds, with no selected ion invented. Offsets are written only
+       * when the bounds are known: an absent cvParam means "unknown",
+       * whereas 0.000000 asserts a zero-width window that nobody measured
+       * -- the exact signature of the old msz bug this writer must not
+       * reproduce. raw2ms, like msconvert, has no width for an old LTQ
+       * whose trailer and method state none. */
+      raw_prec_t own;
+      int has_own = prov != NULL && prov->precursor != NULL &&
+                    prov->precursor(prov->ctx, spec, &own) == 0 &&
+                    !is_nan(own.isolation_target);
+      double lo = spec->isolation_lower, hi = spec->isolation_upper;
+      if (has_own && !is_nan(own.isolation_lower) && !is_nan(own.isolation_upper)) {
+         lo = own.isolation_lower;
+         hi = own.isolation_upper;
       }
-      if (has_window) {
+      int has_bounds = !is_nan(lo) && !is_nan(hi);
+      double target = NAN;
+      if (has_own)
+         target = own.isolation_target;
+      else if (!is_nan(spec->precursor_mz))
+         target = spec->precursor_mz;
+      else if (has_bounds)
+         target = (lo + hi) / 2.0;
+      if (!is_nan(target)) {
          if (sink_printf(s, "<isolationWindow>"
                             "<cvParam cvRef=\"MS\" accession=\"MS:1000827\" "
                             "name=\"isolation window target m/z\" value=\"%.6f\" "
                             "unitCvRef=\"MS\" unitAccession=\"MS:1000040\" "
-                            "unitName=\"m/z\"/>"
-                            "<cvParam cvRef=\"MS\" accession=\"MS:1000828\" "
+                            "unitName=\"m/z\"/>",
+                         target))
+            return -1;
+         if (has_bounds &&
+             sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1000828\" "
                             "name=\"isolation window lower offset\" "
                             "value=\"%.6f\" unitCvRef=\"MS\" "
                             "unitAccession=\"MS:1000040\" unitName=\"m/z\"/>"
                             "<cvParam cvRef=\"MS\" accession=\"MS:1000829\" "
                             "name=\"isolation window upper offset\" "
                             "value=\"%.6f\" unitCvRef=\"MS\" "
-                            "unitAccession=\"MS:1000040\" unitName=\"m/z\"/>"
-                            "</isolationWindow>",
-                         target, lower, upper))
+                            "unitAccession=\"MS:1000040\" unitName=\"m/z\"/>",
+                         fabs(target - lo), fabs(hi - target)))
+            return -1;
+         if (sink_printf(s, "</isolationWindow>"))
             return -1;
       }
       if (!is_nan(spec->precursor_mz)) {
@@ -670,7 +680,7 @@ static int raw_write_mzml(const raw_run_t* run, sink_t* s, int salvage) {
       }
       /* Renumber on write, not fetch, so indices stay sequential when salvage
        * skips spectra; scan_mzml() reconciles the declared count downwards. */
-      int rc = mzml_write_spectrum(s, spec, written);
+      int rc = mzml_write_spectrum(s, &run->provider, spec, written);
       if (run->provider.release)
          run->provider.release(run->provider.ctx, spec);
       if (rc)
@@ -817,6 +827,8 @@ typedef struct {
    /* Optional: absent from raw2ms libraries older than recovery mode. */
    void* (*open_ex)(const char* path, uint64_t run_index, uint32_t flags);
    const char* (*recovery)(const void* run);
+   /* Optional: absent from raw2ms libraries older than the precursor API. */
+   int32_t (*spectrum_precursor)(const void* spectrum, uint64_t k, raw_prec_t* out);
 } raw2ms_api_t;
 
 /* RAW2MS_OPEN_RECOVER in raw2ms.h. */
@@ -907,6 +919,9 @@ static int raw2ms_load(void) {
        handle, "raw2ms_open_ex");
    g_raw2ms.recovery =
        (const char* (*)(const void*))msc_dlsym(handle, "raw2ms_recovery");
+   g_raw2ms.spectrum_precursor =
+       (int32_t (*)(const void*, uint64_t, raw_prec_t*))msc_dlsym(
+           handle, "raw2ms_spectrum_precursor");
    return 0;
 }
 
@@ -914,6 +929,8 @@ static int raw2ms_load(void) {
  * changes, this breaks the build instead of silently misreading spectra. */
 _Static_assert(sizeof(raw_spec_t) == 120,
                "raw_spec_t must mirror Raw2msSpectrum (ABI)");
+_Static_assert(sizeof(raw_prec_t) == 64,
+               "raw_prec_t must mirror Raw2msPrecursor (ABI)");
 
 typedef struct {
    void* run;
@@ -936,6 +953,14 @@ static const char* raw2ms_provider_last_error(void* vctx) {
 static void raw2ms_release(void* vctx, const raw_spec_t* spec) {
    (void)vctx;
    g_raw2ms.spectrum_free((void*)spec);
+}
+
+/* Stage 0 is the spectrum's own isolation (raw2ms.h). 0 when filled. */
+static int raw2ms_precursor(void* vctx, const raw_spec_t* spec, raw_prec_t* out) {
+   (void)vctx;
+   if (g_raw2ms.spectrum_precursor == NULL)
+      return -1;
+   return g_raw2ms.spectrum_precursor(spec, 0, out) == 1 ? 0 : -1;
 }
 
 /* === Size of the vendor input ============================================= */
@@ -1176,6 +1201,7 @@ int compress_raw(const char* input_path, uint64_t run_index, int salvage,
    rr.provider.fetch = raw2ms_fetch;
    rr.provider.release = raw2ms_release;
    rr.provider.last_error = raw2ms_provider_last_error;
+   rr.provider.precursor = raw2ms_precursor;
    rr.n_spectra = (uint64_t)n_spectra;
    rr.source_path = g_raw2ms.source_path(run);
    rr.run_id = g_raw2ms.run_id(run);

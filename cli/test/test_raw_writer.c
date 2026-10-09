@@ -60,6 +60,7 @@ static const raw_spec_t* test_fetch(void* ctx, uint64_t i) {
 }
 
 static void build_run(raw_run_t* run) {
+   memset(run, 0, sizeof(*run));
    memset(g_specs, 0, sizeof(g_specs));
 
    g_specs[0].index = 0;
@@ -541,6 +542,86 @@ static void test_dia_window_without_selected_ion(void) {
    free(doc.buf);
 }
 
+/* raw2ms reports no window for an MS2 whose vendor file states no width
+ * (an old LTQ whose trailer and method lack one; msconvert writes none
+ * either). The target is still known, the offsets are not -- and 0.000000
+ * would assert a zero-width window, the old-build bug signature. */
+static void test_unknown_window_bounds_omit_the_offsets(void) {
+   raw_run_t run;
+   build_run(&run);
+   g_specs[1].isolation_lower = NAN;
+   g_specs[1].isolation_upper = NAN;
+   mzml_buf_t doc;
+   if (raw_write_mzml_mem(&run, 0, &doc) != 0) {
+      fprintf(stderr, "FAIL: raw_write_mzml_mem error\n");
+      failures++;
+      return;
+   }
+   CHECK(strstr(doc.buf, "name=\"isolation window target m/z\" value=\"456.789100\"") != NULL,
+         "the target is still the selected ion");
+   CHECK(strstr(doc.buf, "isolation window lower offset") == NULL &&
+             strstr(doc.buf, "isolation window upper offset") == NULL,
+         "no offset cvParam is written for unknown bounds");
+   CHECK(strstr(doc.buf, "value=\"0.000000\" unitCvRef=\"MS\" unitAccession=\"MS:1000040\"") == NULL,
+         "no zero-width window is asserted");
+   CHECK(strstr(doc.buf, "name=\"selected ion m/z\" value=\"456.789100\"") != NULL,
+         "the selected ion is kept");
+   yxml_t* xml = alloc_yxml();
+   int bad = 0;
+   for (size_t i = 0; i < doc.len; i++) {
+      if (yxml_parse(xml, doc.buf[i]) < 0) {
+         bad = 1;
+         break;
+      }
+   }
+   CHECK(!bad, "the document is well-formed XML");
+   free(xml);
+   free(doc.buf);
+}
+
+/* A Thermo DDA scan with monoisotopic correction: the quadrupole isolated
+ * 484.2132 +/- 1 but the selected (mono) ion is 483.8797. msconvert writes
+ * the centre as the target with symmetric offsets; centring on the selected
+ * ion would skew the window (0.499 / 1.501). */
+static int test_precursor_stage(void* ctx, const raw_spec_t* spec, raw_prec_t* out) {
+   (void)ctx;
+   if (spec->index != 1)
+      return -1;
+   memset(out, 0, sizeof(*out));
+   out->mz = 483.8797;
+   out->isolation_target = 484.2132;
+   out->isolation_lower = 483.2132;
+   out->isolation_upper = 485.2132;
+   out->collision_energy = NAN;
+   out->parent_index = -1;
+   out->precursor_id = -1;
+   out->charge = 2;
+   return 0;
+}
+
+static void test_window_target_is_the_isolation_centre(void) {
+   raw_run_t run;
+   build_run(&run);
+   run.provider.precursor = test_precursor_stage;
+   g_specs[1].precursor_mz = 483.8797;
+   g_specs[1].isolation_lower = 483.2132;
+   g_specs[1].isolation_upper = 485.2132;
+   mzml_buf_t doc;
+   if (raw_write_mzml_mem(&run, 0, &doc) != 0) {
+      fprintf(stderr, "FAIL: raw_write_mzml_mem error\n");
+      failures++;
+      return;
+   }
+   CHECK(strstr(doc.buf, "name=\"isolation window target m/z\" value=\"484.213200\"") != NULL,
+         "the target is the isolation centre, not the selected ion");
+   CHECK(strstr(doc.buf, "name=\"isolation window lower offset\" value=\"1.000000\"") != NULL &&
+             strstr(doc.buf, "name=\"isolation window upper offset\" value=\"1.000000\"") != NULL,
+         "the offsets are symmetric about the centre");
+   CHECK(strstr(doc.buf, "name=\"selected ion m/z\" value=\"483.879700\"") != NULL,
+         "the selected ion is the monoisotopic m/z");
+   free(doc.buf);
+}
+
 static void test_fd_writer_matches_memory_writer(void) {
    mzml_buf_t doc;
    if (write_doc(&doc))
@@ -800,6 +881,8 @@ int main(void) {
    RUN_TEST(test_mzml_is_well_formed_xml);
    RUN_TEST(test_recovered_run_omits_lost_times_and_says_so);
    RUN_TEST(test_dia_window_without_selected_ion);
+   RUN_TEST(test_unknown_window_bounds_omit_the_offsets);
+   RUN_TEST(test_window_target_is_the_isolation_centre);
    RUN_TEST(test_fd_writer_matches_memory_writer);
    RUN_TEST(test_generated_mzml_compresses_via_pipeline);
    RUN_TEST(test_fetch_failure_is_fatal_without_salvage);
