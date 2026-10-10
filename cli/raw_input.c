@@ -393,6 +393,71 @@ static int mzml_write_header(sink_t* s, const raw_run_t* run, uint64_t count) {
    return 0;
 }
 
+/* RAW2MS_ACTIVATION_* -> its psi-ms term; NULL for unknown/unmapped. */
+static const char* activation_term(int32_t a, const char** name) {
+   switch (a) {
+   case 1: *name = "collision-induced dissociation"; return "MS:1000133";
+   case 2: *name = "beam-type collision-induced dissociation"; return "MS:1000422";
+   case 3: *name = "electron transfer dissociation"; return "MS:1000598";
+   case 4: *name = "electron capture dissociation"; return "MS:1000250";
+   case 5: *name = "negative electron transfer dissociation"; return "MS:1003247";
+   case 6: *name = "pulsed q dissociation"; return "MS:1000599";
+   default: return NULL;
+   }
+}
+
+/* <activation> as raw2ms's writer (and msconvert) spells it: for ETciD the
+ * CID term comes first, then the method, for EThcD the plain beam-type term
+ * after it, then the supplemental term, the collision energy and the
+ * supplemental energy. With no method known the neutral MS:1000044 stands in,
+ * which also keeps the element non-empty as the schema requires. */
+static int write_activation(sink_t* s, const raw_prec_t* own, const raw_extra_t* extra) {
+   int32_t act = own != NULL ? own->activation : 0;
+   int32_t supp = extra != NULL ? extra->supplemental_activation : 0;
+   const char* name = NULL;
+   const char* acc = activation_term(act, &name);
+   if (sink_printf(s, "<activation>"))
+      return -1;
+   if (supp == 1 &&
+       sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1000133\" "
+                      "name=\"collision-induced dissociation\" value=\"\"/>"))
+      return -1;
+   if (acc == NULL) {
+      acc = "MS:1000044";
+      name = "dissociation method";
+   }
+   if (sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"%s\" name=\"%s\" value=\"\"/>",
+                   acc, name))
+      return -1;
+   if (supp == 2 && act != 2 &&
+       sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1000422\" "
+                      "name=\"beam-type collision-induced dissociation\" value=\"\"/>"))
+      return -1;
+   if (supp == 1 &&
+       sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1002679\" "
+                      "name=\"supplemental collision-induced dissociation\" value=\"\"/>"))
+      return -1;
+   if (supp == 2 &&
+       sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1002678\" "
+                      "name=\"supplemental beam-type collision-induced dissociation\" "
+                      "value=\"\"/>"))
+      return -1;
+   if (own != NULL && !is_nan(own->collision_energy) &&
+       sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1000045\" "
+                      "name=\"collision energy\" value=\"%.2f\" unitCvRef=\"UO\" "
+                      "unitAccession=\"UO:0000266\" unitName=\"electronvolt\"/>",
+                   own->collision_energy))
+      return -1;
+   if (extra != NULL && supp != 0 && !is_nan(extra->supplemental_energy) &&
+       sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1002680\" "
+                      "name=\"supplemental collision energy\" value=\"%.1f\" "
+                      "unitCvRef=\"UO\" unitAccession=\"UO:0000266\" "
+                      "unitName=\"electronvolt\"/>",
+                   extra->supplemental_energy))
+      return -1;
+   return sink_printf(s, "</activation>");
+}
+
 static int mzml_write_spectrum(sink_t* s, const raw_provider_t* prov,
                                const raw_spec_t* spec, uint64_t seq) {
    uint64_t n = spec->n_peaks;
@@ -454,6 +519,10 @@ static int mzml_write_spectrum(sink_t* s, const raw_provider_t* prov,
          return -1;
    }
 
+   raw_extra_t extra;
+   int has_extra = prov != NULL && prov->extra != NULL &&
+                   prov->extra(prov->ctx, spec, &extra) == 0;
+
    /* Summary numbers, accumulated in double like raw2ms does (float32
     * summation loses counts over a large continuum spectrum). */
    double tic = 0.0;
@@ -476,12 +545,26 @@ static int mzml_write_spectrum(sink_t* s, const raw_provider_t* prov,
    if (sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1000505\" "
                       "name=\"base peak intensity\" value=\"%.6f\"/>", base_int))
       return -1;
+   /* raw2ms's (and msconvert's) place for the CV: after the base peak. */
+   if (has_extra && !is_nan(extra.faims_cv) &&
+       sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1001581\" "
+                      "name=\"FAIMS compensation voltage\" value=\"%.6f\"/>",
+                   extra.faims_cv))
+      return -1;
    if (sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1000528\" "
                       "name=\"lowest observed m/z\" value=\"%.6f\"/>", lo))
       return -1;
    if (sink_printf(s, "<cvParam cvRef=\"MS\" accession=\"MS:1000527\" "
                       "name=\"highest observed m/z\" value=\"%.6f\"/>", hi))
       return -1;
+   if (has_extra && extra.scan_description != NULL) {
+      if (sink_printf(s, "<userParam name=\"scan description\" value=\""))
+         return -1;
+      if (sink_put_escaped(s, extra.scan_description))
+         return -1;
+      if (sink_printf(s, "\" type=\"xsd:string\"/>"))
+         return -1;
+   }
 
    if (sink_printf(s, "<scanList count=\"1\"><cvParam cvRef=\"MS\" "
                       "accession=\"MS:1000795\" name=\"no combination\" value=\"\"/>"
@@ -590,11 +673,9 @@ static int mzml_write_spectrum(sink_t* s, const raw_provider_t* prov,
          if (sink_printf(s, "</selectedIon></selectedIonList>"))
             return -1;
       }
-      /* activation may not be empty; the C API exposes no collision energy,
-    * so the neutral dissociation-method term stands in. */
-      if (sink_printf(s, "<activation><cvParam cvRef=\"MS\" "
-                         "accession=\"MS:1000044\" name=\"dissociation method\" "
-                         "value=\"\"/></activation></precursor></precursorList>"))
+      if (write_activation(s, has_own ? &own : NULL, has_extra ? &extra : NULL))
+         return -1;
+      if (sink_printf(s, "</precursor></precursorList>"))
          return -1;
    }
 
@@ -829,6 +910,11 @@ typedef struct {
    const char* (*recovery)(const void* run);
    /* Optional: absent from raw2ms libraries older than the precursor API. */
    int32_t (*spectrum_precursor)(const void* spectrum, uint64_t k, raw_prec_t* out);
+   /* Optional: absent from raw2ms libraries before 2026-10-10. */
+   double (*spectrum_faims_cv)(const void* spectrum);
+   const char* (*spectrum_scan_description)(const void* spectrum);
+   int32_t (*spectrum_precursor_supplemental)(const void* spectrum, uint64_t k,
+                                              int32_t* activation, double* energy);
 } raw2ms_api_t;
 
 /* RAW2MS_OPEN_RECOVER in raw2ms.h. */
@@ -922,6 +1008,13 @@ static int raw2ms_load(void) {
    g_raw2ms.spectrum_precursor =
        (int32_t (*)(const void*, uint64_t, raw_prec_t*))msc_dlsym(
            handle, "raw2ms_spectrum_precursor");
+   g_raw2ms.spectrum_faims_cv =
+       (double (*)(const void*))msc_dlsym(handle, "raw2ms_spectrum_faims_cv");
+   g_raw2ms.spectrum_scan_description = (const char* (*)(const void*))msc_dlsym(
+       handle, "raw2ms_spectrum_scan_description");
+   g_raw2ms.spectrum_precursor_supplemental =
+       (int32_t (*)(const void*, uint64_t, int32_t*, double*))msc_dlsym(
+           handle, "raw2ms_spectrum_precursor_supplemental");
    return 0;
 }
 
@@ -961,6 +1054,26 @@ static int raw2ms_precursor(void* vctx, const raw_spec_t* spec, raw_prec_t* out)
    if (g_raw2ms.spectrum_precursor == NULL)
       return -1;
    return g_raw2ms.spectrum_precursor(spec, 0, out) == 1 ? 0 : -1;
+}
+
+/* Whatever of raw_extra_t this library exports; 0 always (absent fields stay
+ * NaN/NULL/0, which the writer reads as "not recorded"). */
+static int raw2ms_extra(void* vctx, const raw_spec_t* spec, raw_extra_t* out) {
+   (void)vctx;
+   out->faims_cv = g_raw2ms.spectrum_faims_cv ? g_raw2ms.spectrum_faims_cv(spec) : NAN;
+   out->scan_description =
+       g_raw2ms.spectrum_scan_description ? g_raw2ms.spectrum_scan_description(spec) : NULL;
+   out->supplemental_activation = 0;
+   out->supplemental_energy = NAN;
+   if (g_raw2ms.spectrum_precursor_supplemental != NULL) {
+      int32_t a = 0;
+      double e = NAN;
+      if (g_raw2ms.spectrum_precursor_supplemental(spec, 0, &a, &e) == 1) {
+         out->supplemental_activation = a;
+         out->supplemental_energy = e;
+      }
+   }
+   return 0;
 }
 
 /* === Size of the vendor input ============================================= */
@@ -1202,6 +1315,7 @@ int compress_raw(const char* input_path, uint64_t run_index, int salvage,
    rr.provider.release = raw2ms_release;
    rr.provider.last_error = raw2ms_provider_last_error;
    rr.provider.precursor = raw2ms_precursor;
+   rr.provider.extra = raw2ms_extra;
    rr.n_spectra = (uint64_t)n_spectra;
    rr.source_path = g_raw2ms.source_path(run);
    rr.run_id = g_raw2ms.run_id(run);

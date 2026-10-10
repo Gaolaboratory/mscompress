@@ -622,6 +622,135 @@ static void test_window_target_is_the_isolation_centre(void) {
    free(doc.buf);
 }
 
+/* An EThcD MS2 on FAIMS: the activation block follows raw2ms's own writer
+ * (and msconvert): ETD, the plain beam-type term, the supplemental term, the
+ * collision energy, then the supplemental energy; the FAIMS CV sits after the
+ * base peak; the scan description is an escaped userParam. */
+static int32_t g_act = 0, g_supp = 0;
+static double g_ce = NAN, g_supp_e = NAN, g_cv = NAN;
+static const char* g_desc = NULL;
+
+static int test_activation_stage(void* ctx, const raw_spec_t* spec, raw_prec_t* out) {
+   (void)ctx;
+   if (spec->index != 1)
+      return -1;
+   memset(out, 0, sizeof(*out));
+   out->mz = 456.7891;
+   out->isolation_target = 456.7891;
+   out->isolation_lower = NAN;
+   out->isolation_upper = NAN;
+   out->collision_energy = g_ce;
+   out->parent_index = -1;
+   out->precursor_id = -1;
+   out->charge = 2;
+   out->activation = g_act;
+   return 0;
+}
+
+static int test_extra(void* ctx, const raw_spec_t* spec, raw_extra_t* out) {
+   (void)ctx;
+   out->faims_cv = spec->index == 1 ? g_cv : NAN;
+   out->scan_description = spec->index == 1 ? g_desc : NULL;
+   out->supplemental_activation = spec->index == 1 ? g_supp : 0;
+   out->supplemental_energy = spec->index == 1 ? g_supp_e : NAN;
+   return 0;
+}
+
+static char* write_with_activation(int with_extra) {
+   raw_run_t run;
+   build_run(&run);
+   run.provider.precursor = test_activation_stage;
+   if (with_extra)
+      run.provider.extra = test_extra;
+   mzml_buf_t doc;
+   if (raw_write_mzml_mem(&run, 0, &doc) != 0) {
+      fprintf(stderr, "FAIL: raw_write_mzml_mem error\n");
+      failures++;
+      return NULL;
+   }
+   return doc.buf;
+}
+
+/* `needles` must occur in this order, each after the previous one. */
+static int in_order(const char* hay, const char* const* needles, int n) {
+   const char* at = hay;
+   for (int i = 0; i < n; i++) {
+      const char* f = strstr(at, needles[i]);
+      if (f == NULL)
+         return 0;
+      at = f + strlen(needles[i]);
+   }
+   return 1;
+}
+
+static void test_ethcd_faims_and_scan_description(void) {
+   g_act = 3; /* ETD */
+   g_supp = 2; /* beam-type CID */
+   g_ce = 25.0;
+   g_supp_e = 0.0;
+   g_cv = -45.0;
+   g_desc = "CV-45 & <hi>";
+   char* xml = write_with_activation(1);
+   if (xml == NULL)
+      return;
+   const char* act[] = {
+       "<activation>",
+       "accession=\"MS:1000598\" name=\"electron transfer dissociation\"",
+       "accession=\"MS:1000422\" name=\"beam-type collision-induced dissociation\"",
+       "accession=\"MS:1002678\" name=\"supplemental beam-type collision-induced dissociation\"",
+       "accession=\"MS:1000045\" name=\"collision energy\" value=\"25.00\"",
+       "accession=\"MS:1002680\" name=\"supplemental collision energy\" value=\"0.0\"",
+       "</activation>"};
+   CHECK(in_order(xml, act, 7), "EThcD activation terms in msconvert's order");
+   const char* cv[] = {"name=\"base peak intensity\"",
+                       "accession=\"MS:1001581\" name=\"FAIMS compensation voltage\" value=\"-45.000000\"",
+                       "name=\"lowest observed m/z\""};
+   CHECK(in_order(xml, cv, 3), "FAIMS CV after the base peak, before the observed range");
+   CHECK(strstr(xml, "<userParam name=\"scan description\" value=\"CV-45 &amp; &lt;hi&gt;\" "
+                     "type=\"xsd:string\"/>") != NULL,
+         "scan description is an escaped userParam");
+   CHECK(strstr(xml, "MS:1000044") == NULL, "no neutral term once the method is known");
+   free(xml);
+}
+
+static void test_etcid_puts_cid_first(void) {
+   g_act = 3; /* ETD */
+   g_supp = 1; /* CID */
+   g_ce = 35.0;
+   g_supp_e = 0.0;
+   g_cv = NAN;
+   g_desc = NULL;
+   char* xml = write_with_activation(1);
+   if (xml == NULL)
+      return;
+   const char* act[] = {
+       "<activation>",
+       "accession=\"MS:1000133\" name=\"collision-induced dissociation\"",
+       "accession=\"MS:1000598\"",
+       "accession=\"MS:1002679\" name=\"supplemental collision-induced dissociation\"",
+       "accession=\"MS:1000045\"", "accession=\"MS:1002680\"", "</activation>"};
+   CHECK(in_order(xml, act, 7), "ETciD: CID, ETD, supplemental CID, energies");
+   CHECK(strstr(xml, "MS:1001581") == NULL && strstr(xml, "scan description") == NULL,
+         "no FAIMS CV or description when absent");
+   free(xml);
+}
+
+static void test_hcd_without_extra_provider(void) {
+   g_act = 2; /* beam-type CID */
+   g_ce = 30.0;
+   char* xml = write_with_activation(0);
+   if (xml == NULL)
+      return;
+   const char* act[] = {"<activation>",
+                        "accession=\"MS:1000422\" name=\"beam-type collision-induced dissociation\"",
+                        "accession=\"MS:1000045\" name=\"collision energy\" value=\"30.00\"",
+                        "</activation>"};
+   CHECK(in_order(xml, act, 4), "HCD and its energy from the precursor stage alone");
+   CHECK(strstr(xml, "MS:1002680") == NULL && strstr(xml, "MS:1000598") == NULL,
+         "no supplemental terms without the extra callback");
+   free(xml);
+}
+
 static void test_fd_writer_matches_memory_writer(void) {
    mzml_buf_t doc;
    if (write_doc(&doc))
@@ -883,6 +1012,9 @@ int main(void) {
    RUN_TEST(test_dia_window_without_selected_ion);
    RUN_TEST(test_unknown_window_bounds_omit_the_offsets);
    RUN_TEST(test_window_target_is_the_isolation_centre);
+   RUN_TEST(test_ethcd_faims_and_scan_description);
+   RUN_TEST(test_etcid_puts_cid_first);
+   RUN_TEST(test_hcd_without_extra_provider);
    RUN_TEST(test_fd_writer_matches_memory_writer);
    RUN_TEST(test_generated_mzml_compresses_via_pipeline);
    RUN_TEST(test_fetch_failure_is_fatal_without_salvage);

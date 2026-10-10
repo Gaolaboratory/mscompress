@@ -86,6 +86,20 @@ typedef struct {
 } raw_prec_t;
 
 /**
+ * @brief Per-spectrum metadata beyond raw_spec_t and raw_prec_t.
+ *
+ * Filled from the optional raw2ms exports raw2ms_spectrum_faims_cv,
+ * raw2ms_spectrum_scan_description and raw2ms_spectrum_precursor_supplemental
+ * (stage 0). Absent values: NaN, NULL, activation 0.
+ */
+typedef struct {
+   double faims_cv;                 /* volts; NaN when FAIMS was off */
+   const char* scan_description;    /* borrowed until release; NULL if none */
+   int32_t supplemental_activation; /* RAW2MS_ACTIVATION_*; 0 none */
+   double supplemental_energy;      /* eV; NaN when unrecorded */
+} raw_extra_t;
+
+/**
  * @brief Spectra are pulled one at a time so neither the in-memory nor the
  *        chunked sink ever holds more than one spectrum's mzML text.
  */
@@ -101,6 +115,10 @@ typedef struct {
     * when the provider has no such notion; the writer then centres the
     * window on the selected ion. */
    int (*precursor)(void* ctx, const raw_spec_t* spec, raw_prec_t* out);
+   /* Optional: fill `out` (every field, absent ones as documented on
+    * raw_extra_t) and return 0, or nonzero when the provider cannot say.
+    * NULL when the provider has no such notion. */
+   int (*extra)(void* ctx, const raw_spec_t* spec, raw_extra_t* out);
 } raw_provider_t;
 
 /**
