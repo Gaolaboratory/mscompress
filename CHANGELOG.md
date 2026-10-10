@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.1.0](https://github.com/Gaolaboratory/mscompress/compare/v1.0.16...v1.1.0) (2026-10-10)
+
+
+### Features
+
+* activation, supplemental activation, FAIMS CV and scan description from raw2ms ([19c5c07](https://github.com/Gaolaboratory/mscompress/commit/19c5c0729464edc9b60e7bd86442d022d2f2a819))
+* compress vendor raw files directly to msz via raw2ms ([b46cf30](https://github.com/Gaolaboratory/mscompress/commit/b46cf30a178a38e9777c7fd747f7b6cffb577310))
+* declare nativeID format in sourceFile for raw-converted mzML ([046d9ef](https://github.com/Gaolaboratory/mscompress/commit/046d9ef527ede1230a60a8a7efada51fda75cadd))
+* extraction emits indexedmzML with true spectrum offsets ([da2a5de](https://github.com/Gaolaboratory/mscompress/commit/da2a5dee3ffdd42052292ffc7b562a034759635d))
+* newline-terminate the raw-path mzML stream ([2821cfa](https://github.com/Gaolaboratory/mscompress/commit/2821cfada762c1f0b976baaa4066378deb1781ce))
+* **raw,decompress:** timsTOF mzML labelled centroid; repair non-MSFragger mzML tails on decompress ([8a2b52e](https://github.com/Gaolaboratory/mscompress/commit/8a2b52e7fec6f9acc57b1036e1c5afc677a1c834))
+* **raw:** support Bruker TSF and BAF vendor inputs ([5df95f3](https://github.com/Gaolaboratory/mscompress/commit/5df95f35b35b772cd542cfad20a00b45380fd4de))
+* surface raw2ms errors and add --salvage for corrupt vendor files ([a67e495](https://github.com/Gaolaboratory/mscompress/commit/a67e4958f842ad09c377194479a09c198b8a6a16))
+* take the isolation target from raw2ms_spectrum_precursor ([20de082](https://github.com/Gaolaboratory/mscompress/commit/20de082cbc33b35b10e891d066da7d517759e88a))
+* vendor a public-domain SHA-1 for mzML fileChecksum ([c7703df](https://github.com/Gaolaboratory/mscompress/commit/c7703df405428fcb19dd750462b92c3f77428b56))
+
+
+### Bug Fixes
+
+* abort extraction when a spectrum/footer write fails ([71c3b46](https://github.com/Gaolaboratory/mscompress/commit/71c3b465dc23d6692cbdde781428e09d356cbc9b))
+* **build:** restore -O3 for vendored zlib (was silently dropped) ([d8fceb8](https://github.com/Gaolaboratory/mscompress/commit/d8fceb8405b3da10fccb5ab101ab638dba90a1b9))
+* **cli:** balance zlib inflate lifecycle and free per-file preprocessor state ([f778f5a](https://github.com/Gaolaboratory/mscompress/commit/f778f5a929ad88402b91829e4bd1876e9174ac9d))
+* emit required &lt;indexListOffset&gt; in wrap-mode extraction output ([bea7bde](https://github.com/Gaolaboratory/mscompress/commit/bea7bde7fb210daf6c9af4b865d53cab1b6aaf2f))
+* extract the full scan list and the final mzML spectrum ([#205](https://github.com/Gaolaboratory/mscompress/issues/205)) ([0f3f30a](https://github.com/Gaolaboratory/mscompress/commit/0f3f30a285141be1653578ed8b92c770d3823d90))
+* handle zero-spectrum mzML files without crashing ([08114c3](https://github.com/Gaolaboratory/mscompress/commit/08114c3baeff11e61135bdaf1688947b1cf72896))
+* keep DIA isolation windows in the raw2ms mzML writer ([d960c4e](https://github.com/Gaolaboratory/mscompress/commit/d960c4ecc2d87b660b985ff0b2e665cb4c5964a9))
+* segfault on lossy compression of non-indexed mzML ([#176](https://github.com/Gaolaboratory/mscompress/issues/176)) ([7f2c7a8](https://github.com/Gaolaboratory/mscompress/commit/7f2c7a81942e0543c3a5f57f013cbd3e3d73fa3e))
+* stop type-punning --extract-scans values through a uint32_t view ([7f3e49a](https://github.com/Gaolaboratory/mscompress/commit/7f3e49aec08592cddf2a9f5a6913d3cb705001ca))
+* stop Windows checkouts rewriting test fixtures to CRLF ([4abd08c](https://github.com/Gaolaboratory/mscompress/commit/4abd08c966546f709aa0c96914f81833943f5ebf))
+* zlib re-encode of &gt;64 KB arrays corrupts output or segfaults ([38badb4](https://github.com/Gaolaboratory/mscompress/commit/38badb496a334d92202a3f5311bb58e90158ee5e))
+
 ## [1.0.16](https://github.com/chrisagrams/mscompress/compare/v1.0.15...v1.0.16) (2026-05-18)
 
 
