@@ -16,7 +16,7 @@
 #include "mscompress.h"
 
 #ifdef _WIN32
-#include <Windows.h>
+#include <windows.h>
 #include <direct.h>
 #include <io.h>
 #define close _close
@@ -36,6 +36,10 @@
  * to the checksum element and to EOF. After decompressing, repair the tail
  * on disk and tell the user what was changed. Best effort: on any anomaly
  * the file is left exactly as decompressed. */
+
+#define PATH_SEP '/'
+#endif
+
 void fix_mzml_closing_tag(const char* path) {
    static const char tag[] = "</indexedmzML>";
    const size_t taglen = sizeof(tag) - 1;
@@ -119,9 +123,6 @@ void fix_mzml_closing_tag(const char* path) {
            "\tnewline%s so the tag ends the file on its own line.\n",
            need_before && need_after ? "s" : "");
 }
-
-#define PATH_SEP '/'
-#endif
 
 /* Cross-platform directory create. Returns 0 on success or if it already
  * exists; -1 on error. */

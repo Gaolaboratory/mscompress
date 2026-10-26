@@ -1,7 +1,20 @@
 set(ZLIB_SOURCE_DIR ${VENDOR_DIR}/zlib)
 # Add a custom target to run nmake and build zlib
 # Set ZLIB_EXTRA_CFLAGS before including this file to pass additional flags.
-if(WIN32)
+if(MINGW)
+# Cross build with GCC (e.g. x86_64-w64-mingw32-gcc from Linux/WSL). Makefile.gcc
+# builds libz.a in-tree, same as the Unix branch. HAS_SSE2 for the same reason
+# as the nmake branch below (the fork's deflate gates hash-table sliding on it).
+add_custom_target(
+zlib_build
+COMMAND make -C ${ZLIB_SOURCE_DIR} -f win32/Makefile.gcc
+CC=${CMAKE_C_COMPILER} AR=${CMAKE_AR} RANLIB=${CMAKE_RANLIB}
+"CFLAGS=-O3 -DHAS_SSE2 -include emmintrin.h ${ZLIB_EXTRA_CFLAGS}" libz.a
+WORKING_DIRECTORY ${ZLIB_SOURCE_DIR}
+BYPRODUCTS ${ZLIB_SOURCE_DIR}/libz.a
+VERBATIM
+)
+elseif(WIN32)
     # The cloudflare fork's Makefile.msc omits HAS_SSE2, without which deflate
     # never slides its hash tables and corrupts any input larger than ~64 KB
     # (configure sets it on Unix). deflate.c only includes intrinsics headers
@@ -35,8 +48,10 @@ else()
     )
 endif()
 # Set the location of the built zlib library
-if(WIN32)
+if(MSVC)
     set(ZLIB_LIBRARY "${ZLIB_BUILD_DIR}/zlib.lib")
+elseif(MINGW)
+set(ZLIB_LIBRARY "${ZLIB_SOURCE_DIR}/libz.a")
 else()
     set(ZLIB_LIBRARY "${ZLIB_SOURCE_DIR}/libz.a")
 endif()

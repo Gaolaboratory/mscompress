@@ -24,6 +24,10 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifdef __MINGW32__
+#include <fcntl.h> /* O_* for the chunked-doc temp file */
+#endif
+
 #include "libbase64.h"
 
 #ifndef VERSION
@@ -822,6 +826,9 @@ uint64_t raw_estimate_mzml_bytes(uint64_t raw_bytes, uint64_t n_spectra) {
    return est;
 }
 
+#ifdef _WIN32
+#include <windows.h> /* MEMORYSTATUSEX for raw_available_bytes */
+#endif
 uint64_t raw_available_bytes(void) {
 #if defined(__linux__)
    FILE* f = fopen("/proc/meminfo", "r");
@@ -839,11 +846,21 @@ uint64_t raw_available_bytes(void) {
          return kb * 1024;
    }
 #endif
+#if defined(_WIN32)
+   /* Windows: report available physical memory via GlobalMemoryStatusEx. */
+   MEMORYSTATUSEX memstat;
+   ZeroMemory(&memstat, sizeof(memstat));
+   memstat.dwLength = sizeof(memstat);
+   if (GlobalMemoryStatusEx(&memstat))
+      return memstat.ullAvailPhys;
+   return 0;
+#else
    long pages = sysconf(_SC_AVPHYS_PAGES);
    long page_size = sysconf(_SC_PAGESIZE);
    if (pages > 0 && page_size > 0)
       return (uint64_t)pages * (uint64_t)page_size;
    return 0;
+#endif
 }
 
 int raw_should_chunk(uint64_t estimate, uint64_t available_bytes) {
@@ -1118,6 +1135,7 @@ static uint64_t raw_size_on_disk(const char* path) {
    return total;
 }
 #else
+#include <sys/stat.h>
 /* Windows: file size only. An unmeasurable directory forces the safe
  * (chunked) path through a huge estimate rather than risking the malloc. */
 static uint64_t raw_size_on_disk(const char* path) {
@@ -1160,7 +1178,11 @@ static int chunked_doc_create(chunked_doc_t* cd) {
    char* name = _tempnam(NULL, "mscompress_raw_");
    if (name == NULL)
       return -1;
+   #ifdef __MINGW32__
+   cd->fd = open(name, O_RDWR | O_CREAT | O_EXCL | O_BINARY, 0600);
+   #else
    cd->fd = _open(name, _O_RDWR | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE);
+   #endif
    if (cd->fd < 0) {
       free(name);
       return -1;

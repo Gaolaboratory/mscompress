@@ -22,7 +22,7 @@
 #include "mscompress.h"
 
 #ifdef _WIN32
-#include <Windows.h>
+#include <windows.h>
 #include <fcntl.h>
 #include <io.h>
 #define close _close
