@@ -1,6 +1,6 @@
 """A versatile compression tool for efficient management of mass-spectrometry data."""
 
-__version__ = "1.0.16"  # x-release-please-version
+__version__ = "1.2.0"  # x-release-please-version
 
 
 from mscompress._core import (
@@ -11,8 +11,15 @@ from mscompress._core import (
     BaseFile,
     MZMLFile,
     MSZFile,
+    MSZXBatchWriter,
     Spectrum,
     Spectra,
+    CACHE_SPECTRA_AUTO,
+    BlockCache,
+    DEFAULT_CACHE_BYTES,
+    get_default_cache,
+    set_cache_budget,
+    get_cache_usage,
     get_num_threads,
     get_filesize,
     list_algorithms,
@@ -49,18 +56,24 @@ from mscompress.types import (
 from mscompress.mszx import (
     # MSZX classes
     MSZXFile,
+    MSZXBatchFile,
     MSZXBuilder,
     MSZXManifest,
+    MSZXBatchManifest,
+    SpectraFileEntry,
     AnnotationEntry,
+    QueryResult,
+    SpectrumIndex,
     # Convenience functions
     create_mszx,
+    compress_batch,
 )
 
 from mscompress.annotations import (
-    # Search results types
-    PSM,
-    TSVReader,
-    PepXMLReader,
+    # Search results
+    PSMTable,
+    SearchMetadata,
+    read_psms,
 )
 
 # Optional parquet support (requires the [parquet] extra).
@@ -83,6 +96,7 @@ __all__ = [
     "BaseFile",
     "MZMLFile",
     "MSZFile",
+    "MSZXBatchWriter",
     "Spectrum",
     "Spectra",
     "SpectrumDict",
@@ -112,15 +126,21 @@ __all__ = [
     "build_composite_metadata",
     # MSZX types
     "MSZXFile",
+    "MSZXBatchFile",
     "MSZXBuilder",
     "MSZXManifest",
+    "MSZXBatchManifest",
+    "SpectraFileEntry",
     "AnnotationEntry",
+    "QueryResult",
+    "SpectrumIndex",
     # MSZX convenience functions
     "create_mszx",
-    # Search results types
-    "PSM",
-    "TSVReader",
-    "PepXMLReader",
+    "compress_batch",
+    # Search results
+    "PSMTable",
+    "SearchMetadata",
+    "read_psms",
 ]
 
 if _HAS_PARQUET:

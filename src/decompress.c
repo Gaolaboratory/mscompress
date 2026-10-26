@@ -11,6 +11,7 @@
 #include "../vendor/lz4/lib/lz4.h"
 #include "../vendor/zlib/zlib.h"
 #include "../vendor/zstd/lib/zstd.h"
+#include "algos/algos.h"
 #include "mscompress.h"
 
 /**
@@ -278,45 +279,6 @@ DWORD WINAPI decompress_routine_win(LPVOID lpParam) {
 #endif
 
 /**
- * @brief Grows `*buff` (doubling, or to `need` if larger) so it holds at least
- *        `need` bytes.
- * @return 0 on success, 1 if realloc fails (`*buff` is left untouched).
- */
-static int grow_buff(char** buff, size_t* cap, size_t need) {
-   if (need <= *cap) return 0;
-   size_t new_cap = *cap * 2;
-   if (new_cap < need) new_cap = need;
-   char* grown = realloc(*buff, new_cap);
-   if (grown == NULL) return 1;
-   *buff = grown;
-   *cap = new_cap;
-   return 0;
-}
-
-/**
- * @brief Runs `target_fun` to encode one spectrum's binary at `*buff + off`,
- *        growing `*buff` and retrying when the encoder reports the output
- *        does not fit (encoders take `*dest_len` as the room left in dest).
- * @param src The binary cursor `a_args->src` points at; rewound on retry.
- * @return 0 on success (`*a_args->dest_len` holds the bytes written), 1 on
- *         error.
- */
-static int encode_into_buff(Algo target_fun, algo_args* a_args, char** src,
-                            char** buff, size_t* cap, size_t off) {
-   char* spec_src = *src;
-   for (;;) {
-      size_t room = *cap - off;
-      *src = spec_src;
-      *a_args->dest_len = room;
-      a_args->dest = (char**)(*buff + off);
-      target_fun((void*)a_args);
-      if (a_args->ret_code != 0) return 1;
-      if (*a_args->dest_len <= room) return 0;
-      if (grow_buff(buff, cap, off + *a_args->dest_len)) return 1;
-   }
-}
-
-/**
  * @brief Thread routine for decompression. Calls the `decmp_block` function to decompress the data blocks and writes the decompressed data to the output buffer.
  * @param args A pointer to the `decompress_args_t` struct containing the arguments for decompression.
  * @return Always returns `NULL`. `args->ret` will contain the decompressed data and `args->ret_len` will contain the length of the decompressed data on success.
@@ -363,6 +325,24 @@ void* decompress_routine(void* args) {
         *decmp_inten_binary = (char*)decmp_block(
             db_args->df->inten_decompression_fun, dctx, db_args->input_map,
             db_args->footer_inten_bin_off, db_args->inten_binary_blk);
+
+   /* Reverse the byte shuffle across the whole block, before the per-spectrum
+    * decode loop walks it. No-op when the file was written without shuffling. */
+   if (decmp_mz_binary != NULL && db_args->df->mz_shuffle_elem > 1 &&
+       unshuffle_block_records(decmp_mz_binary,
+                               db_args->mz_binary_blk->original_size,
+                               db_args->df->mz_shuffle_elem) != 0) {
+      error("decompress_routine: failed to reverse m/z byte shuffle.\n");
+      return NULL;
+   }
+
+   if (decmp_inten_binary != NULL && db_args->df->inten_shuffle_elem > 1 &&
+       unshuffle_block_records(decmp_inten_binary,
+                               db_args->inten_binary_blk->original_size,
+                               db_args->df->inten_shuffle_elem) != 0) {
+      error("decompress_routine: failed to reverse intensity byte shuffle.\n");
+      return NULL;
+   }
 
    // Save original pointers for cleanup (encode functions advance mz/inten pointers)
    char *orig_decmp_mz_binary = decmp_mz_binary,
@@ -416,6 +396,15 @@ void* decompress_routine(void* args) {
       return NULL;
    }
 
+   a_args->z_inflate = alloc_z_stream_inflate();
+
+   if (a_args->z_inflate == NULL) {
+      error("decompress_routine: Failed to allocate inflate z_stream.\n");
+      dealloc_z_stream(a_args->z);
+      free(a_args);
+      return NULL;
+   }
+
    a_args->ret_code = 0; // Initialize return code to 0 (success).
 
 
@@ -442,6 +431,8 @@ void* decompress_routine(void* args) {
             assert(curr_len > 0 && curr_len <= len);
             if (grow_buff(&buff, &buff_cap, buff_off + curr_len)) {
                error("decompress_routine: Failed to grow output buffer.\n");
+               dealloc_z_stream(a_args->z);
+               dealloc_z_stream_inflate(a_args->z_inflate);
                free(a_args);
                return NULL;
             }
@@ -474,6 +465,8 @@ void* decompress_routine(void* args) {
 
             if (db_args->df->target_mz_fun == NULL) {
                error("decompress_routine: target_mz_fun is NULL, cannot decode mz block.\n");
+               dealloc_z_stream(a_args->z);
+               dealloc_z_stream_inflate(a_args->z_inflate);
                free(a_args);
                return NULL;
             }
@@ -484,6 +477,8 @@ void* decompress_routine(void* args) {
             db_args->ret = buff;  // may have moved, even on failure
             if (enc_ret) {
                error("decompress_routine: Failed to encode mz block.\n");
+               dealloc_z_stream(a_args->z);
+               dealloc_z_stream_inflate(a_args->z_inflate);
                free(a_args);
                return NULL;
             }
@@ -508,6 +503,8 @@ void* decompress_routine(void* args) {
             assert(curr_len > 0 && curr_len < len);
             if (grow_buff(&buff, &buff_cap, buff_off + curr_len)) {
                error("decompress_routine: Failed to grow output buffer.\n");
+               dealloc_z_stream(a_args->z);
+               dealloc_z_stream_inflate(a_args->z_inflate);
                free(a_args);
                return NULL;
             }
@@ -540,6 +537,8 @@ void* decompress_routine(void* args) {
 
             if (db_args->df->target_inten_fun == NULL) {
                error("decompress_routine: target_inten_fun is NULL, cannot decode intensity block.\n");
+               dealloc_z_stream(a_args->z);
+               dealloc_z_stream_inflate(a_args->z_inflate);
                free(a_args);
                return NULL;
             }
@@ -550,6 +549,8 @@ void* decompress_routine(void* args) {
             db_args->ret = buff;  // may have moved, even on failure
             if (enc_ret) {
                error("decompress_routine: Failed to encode intensity block.\n");
+               dealloc_z_stream(a_args->z);
+               dealloc_z_stream_inflate(a_args->z_inflate);
                free(a_args);
                return NULL;
             }
@@ -571,6 +572,7 @@ void* decompress_routine(void* args) {
    free(orig_decmp_mz_binary);
    free(orig_decmp_inten_binary);
    dealloc_z_stream(a_args->z);
+   dealloc_z_stream_inflate(a_args->z_inflate);
    free(a_args);
 
    return NULL;
@@ -598,11 +600,17 @@ int decompress_msz(char* input_map, size_t input_filesize,
 
    print("\tDetected .msz file, reading header and footer...\n");
 
+   /* Gate decoding, not identification: --describe still reports the version
+    * of a file this build cannot decode. */
+   if (msz_require_version(input_map, input_filesize) != 0)
+      return -1;
+
    df = get_header_df(input_map);
 
-   parse_footer(&msz_footer, input_map, input_filesize, &xml_block_lens,
-                &mz_binary_block_lens, &inten_binary_block_lens, &divisions,
-                &n_divisions);
+   if (parse_footer(&msz_footer, input_map, input_filesize, &xml_block_lens,
+                    &mz_binary_block_lens, &inten_binary_block_lens, &divisions,
+                    &n_divisions) != 0)
+      return -1;
 
    if (n_divisions == 0) {
       warning("No divisions found in file, aborting...\n");

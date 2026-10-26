@@ -23,9 +23,9 @@ target_include_directories(test_raw_writer PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 if(WIN32)
-    target_link_libraries(test_raw_writer PRIVATE base64 lz4 ${ZLIB_LIBRARY} zstd yxml)
+    target_link_libraries(test_raw_writer PRIVATE base64 lz4 ${ZLIB_LIBRARY} zstd yxml blosc2_shuffle)
 else()
-    target_link_libraries(test_raw_writer PRIVATE base64 lz4 ${ZLIB_LIBRARY} zstd yxml m Threads::Threads ${CMAKE_DL_LIBS})
+    target_link_libraries(test_raw_writer PRIVATE base64 lz4 ${ZLIB_LIBRARY} zstd yxml blosc2_shuffle m Threads::Threads ${CMAKE_DL_LIBS})
 endif()
 add_dependencies(test_raw_writer zlib_build)
 add_test(NAME RawWriterTest COMMAND test_raw_writer)
@@ -47,9 +47,9 @@ target_include_directories(test_idx_writer PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 if(WIN32)
-    target_link_libraries(test_idx_writer PRIVATE base64 lz4 ${ZLIB_LIBRARY} zstd yxml)
+    target_link_libraries(test_idx_writer PRIVATE base64 lz4 ${ZLIB_LIBRARY} zstd yxml blosc2_shuffle)
 else()
-    target_link_libraries(test_idx_writer PRIVATE base64 lz4 ${ZLIB_LIBRARY} zstd yxml m Threads::Threads ${CMAKE_DL_LIBS})
+    target_link_libraries(test_idx_writer PRIVATE base64 lz4 ${ZLIB_LIBRARY} zstd yxml blosc2_shuffle m Threads::Threads ${CMAKE_DL_LIBS})
 endif()
 add_dependencies(test_idx_writer zlib_build)
 add_test(NAME IdxWriterTest COMMAND test_idx_writer)
@@ -114,6 +114,47 @@ add_test(NAME MSZXDecompressTest
     -DINPUT_FILE=${TEST_DATA_DIR}/mszx/test.mszx
     -DTEMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/tmp_mszx
     -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test_mszx.cmake
+)
+
+# Batch mode: N mzML -> one .mszx -> N mzML. Round-trip (byte-identical),
+# dir/glob/list parity, tar validity, and --list.
+add_test(NAME BatchRoundTripTest
+    COMMAND ${CMAKE_COMMAND}
+    -DEXECUTABLE=$<TARGET_FILE:mscompress>
+    -DTEST_MZML=${TEST_DATA_DIR}/test.mzML
+    -DTEMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/tmp_batch
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test_batch.cmake
+)
+
+# Batch paths the round-trip test misses: __N name collisions,
+# --continue-on-error, fail-fast cleanup, and legacy-form batch misdetection.
+add_test(NAME BatchPathsTest
+    COMMAND ${CMAKE_COMMAND}
+    -DEXECUTABLE=$<TARGET_FILE:mscompress>
+    -DTEST_MZML=${TEST_DATA_DIR}/test.mzML
+    -DTEMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/tmp_batch_paths
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test_batch_paths.cmake
+)
+
+# Batch error paths: empty match set + non-seekable (FIFO) output rejection.
+add_test(NAME BatchRejectTest
+    COMMAND ${CMAKE_COMMAND}
+    -DEXECUTABLE=$<TARGET_FILE:mscompress>
+    -DTEST_MZML=${TEST_DATA_DIR}/test.mzML
+    -DTEMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/tmp_batch_reject
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test_batch_reject.cmake
+)
+
+# Per-spectrum index: golden table, --no-index (and querying it errors), and
+# decompression skipping the index member.
+add_test(NAME BatchIndexTest
+    COMMAND ${CMAKE_COMMAND}
+    -DEXECUTABLE=$<TARGET_FILE:mscompress>
+    -DTEST_MZML=${TEST_DATA_DIR}/test.mzML
+    -DTEST_MZML_B=${TEST_DATA_DIR}/sciex_ttof6600_100.mzML
+    -DGOLDEN_TSV=${TEST_DATA_DIR}/mszx/index_golden.tsv
+    -DTEMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/tmp_batch_index
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test_index.cmake
 )
 
 # Helper macro to add simple tests
@@ -302,3 +343,60 @@ if(Python3_Interpreter_FOUND)
 else()
     message(STATUS "ExtractIndexTest skipped: no Python 3 interpreter found")
 endif()
+# --- byte shuffle -----------------------------------------------------------
+
+# A --shuffle file must decompress byte-identically, differ from the
+# unshuffled output, and be smaller.
+add_test(NAME ShuffleRoundTripTest
+    COMMAND ${CMAKE_COMMAND}
+    -DEXECUTABLE=$<TARGET_FILE:mscompress>
+    -DINPUT_FILE=${TEST_DATA_DIR}/test.mzML
+    -DTEMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/tmp_shuffle
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test_shuffle.cmake
+)
+
+# test.msz predates the shuffle, so it has the marker bit clear and must still
+# decompress to exactly test.mzML. Guards the footer flag-bit scheme.
+add_test(NAME ShuffleBackwardCompatTest
+    COMMAND ${CMAKE_COMMAND}
+    -DEXECUTABLE=$<TARGET_FILE:mscompress>
+    -DMODE=decompress
+    -DINPUT_FILE=${TEST_DATA_DIR}/test.msz
+    -DEXPECTED_FILE=${TEST_DATA_DIR}/test.mzML
+    -DTEMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/tmp_shuffle_comorbid
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test.cmake
+)
+
+# A checked-in shuffled file (msz 0.2), so the decode path is tested against
+# committed bytes rather than only against whatever this build just wrote.
+add_test(NAME ShuffleFixtureDecompressTest
+    COMMAND ${CMAKE_COMMAND}
+    -DEXECUTABLE=$<TARGET_FILE:mscompress>
+    -DMODE=decompress
+    -DINPUT_FILE=${TEST_DATA_DIR}/test_shuffled.msz
+    -DEXPECTED_FILE=${TEST_DATA_DIR}/test.mzML
+    -DTEMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/tmp_shuffle_fixture
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test.cmake
+)
+
+# --no-shuffle must still produce a working file, and one an 0.1-only reader can
+# read: with the shuffle off there is no 0.2 feature in play, so it stays 0.1.
+add_test(NAME NoShuffleTest
+    COMMAND ${CMAKE_COMMAND}
+    -DEXECUTABLE=$<TARGET_FILE:mscompress>
+    "-DARGS=--no-shuffle"
+    -DINPUT_FILE=${TEST_DATA_DIR}/test.mzML
+    -DTEMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/tmp_no_shuffle
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test_simple.cmake
+)
+
+# A lossy stream has no fixed post-transform element width, so --shuffle must be
+# skipped for it rather than corrupting the stream.
+add_test(NAME ShuffleWithLossyTest
+    COMMAND ${CMAKE_COMMAND}
+    -DEXECUTABLE=$<TARGET_FILE:mscompress>
+    "-DARGS=--shuffle;--mz-lossy;delta32"
+    -DINPUT_FILE=${TEST_DATA_DIR}/test.mzML
+    -DTEMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/tmp_shuffle_lossy
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test_simple.cmake
+)

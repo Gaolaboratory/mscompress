@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #ifndef _WIN32
@@ -22,96 +23,6 @@
 #include "yxml.h"
 
 static const char* program_name = NULL;
-
-/* MSFragger 4.4.1+ only accepts an mzML whose </indexedmzML> sits on its own
- * line: a newline immediately before the tag and one ending the file. mzML
- * written by older raw2ms builds (and some other converters) glues the tag
- * to the checksum element and to EOF. After decompressing, repair the tail
- * on disk and tell the user what was changed. Best effort: on any anomaly
- * the file is left exactly as decompressed. */
-static void fix_mzml_closing_tag(const char* path) {
-   static const char tag[] = "</indexedmzML>";
-   const size_t taglen = sizeof(tag) - 1;
-
-   if (!path) return;
-   FILE* f = fopen(path, "r+b");
-   if (!f) return;
-
-   long size;
-   if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < (long)taglen) {
-      fclose(f);
-      return;
-   }
-
-   char tail[64];
-   long start = size - (long)sizeof(tail);
-   if (start < 0) start = 0;
-   if (fseek(f, start, SEEK_SET) != 0) {
-      fclose(f);
-      return;
-   }
-   size_t got = fread(tail, 1, (size_t)(size - start), f);
-
-   /* the last occurrence in the tail is the document's closing tag */
-   char* hit = NULL;
-   for (char* p = tail + got - taglen; p >= tail; p--)
-      if (memcmp(p, tag, taglen) == 0) {
-         hit = p;
-         break;
-      }
-   if (!hit) { /* flat mzML (no indexed wrapper) or tag not at the end */
-      fclose(f);
-      return;
-   }
-   long tag_pos = start + (long)(hit - tail);
-
-   char prev = '\n';
-   if (hit > tail)
-      prev = hit[-1];
-   else if (start > 0) {
-      if (fseek(f, start - 1, SEEK_SET) != 0 || fread(&prev, 1, 1, f) != 1) {
-         fclose(f);
-         return;
-      }
-   }
-   long end_after = tag_pos + (long)taglen;
-   int need_before = start == 0 && tag_pos == 0 ? 0 : (prev != '\n');
-   int need_after = !(size == end_after + 1); /* must end tag + one '\n' */
-   if (!need_before && !need_after) {
-      fclose(f);
-      return;
-   }
-
-   if (fseek(f, tag_pos, SEEK_SET) != 0) {
-      fclose(f);
-      return;
-   }
-   if (need_before && fputc('\n', f) == EOF) {
-      fclose(f);
-      return;
-   }
-   if (fwrite(tag, 1, taglen, f) != taglen || fputc('\n', f) == EOF) {
-      fclose(f);
-      return;
-   }
-   long new_size = tag_pos + (need_before ? 1 : 0) + (long)taglen + 1;
-   fflush(f);
-#ifdef _WIN32
-   _chsize(_fileno(f), new_size);
-#else
-   ftruncate(fileno(f), new_size);
-#endif
-   fclose(f);
-
-   /* print() is gated on --verbose; this notice is for whoever decompressed
-    * the file, so it goes to stderr unconditionally (stdout may be
-    * redirected). */
-   fprintf(stderr,
-           "\tNote: the original mzML was not MSFragger 4.4.1+ compatible\n"
-           "\t(</indexedmzML> was not on its own line); added the missing\n"
-           "\tnewline%s so the tag ends the file on its own line.\n",
-           need_before && need_after ? "s" : "");
-}
 
 
 /* --run-index: which run of a multi-run vendor container (.wiff) to
@@ -142,7 +53,7 @@ static char* recovered_name(const char* path) {
 }
 
 /* Vendor raw input operation; local to the CLI (src/ operations run 1-7). */
-#define COMPRESS_RAW 8
+#define COMPRESS_RAW 10
 
 static void print_usage(FILE* stream, int exit_code) {
    fprintf(stream, "Usage: %s [OPTION...] input_file [output_file]\n",
@@ -204,6 +115,12 @@ static void print_usage(FILE* stream, int exit_code) {
            " --zstd-compression-level level Set zstd compression level (1-22). "
            "(default: 3)\n");
    fprintf(stream,
+           " --no-shuffle                   Disable the byte shuffle of binary "
+           "arrays. (shuffle is enabled by default)\n");
+   fprintf(stream,
+           " --shuffle                      Byte-shuffle binary arrays before "
+           "compression (lossless streams only). (enabled by default)\n");
+   fprintf(stream,
            "  -b, --blocksize size          Set maximum blocksize (xKB, xMB, "
            "xGB). (default: 100MB)\n");
    fprintf(stream,
@@ -217,6 +134,34 @@ static void print_usage(FILE* stream, int exit_code) {
    fprintf(stream,
            "      --json                    Output in JSON format (for "
            "--version, --describe, --list-algorithms).\n");
+   fprintf(stream, "\nBatch mode (many mzML -> one .mszx archive):\n");
+   fprintf(stream,
+           "      --batch                   Compress all input mzML into one "
+           ".mszx (inferred for dirs/globs/multiple inputs).\n");
+   fprintf(stream,
+           "  -r, --recursive               Recurse into subdirectories for "
+           "directory inputs.\n");
+   fprintf(stream,
+           "      --from-file path          Read newline-separated input paths "
+           "from a manifest ('-' = stdin).\n");
+   fprintf(stream,
+           "  -o, --output path             Output archive path (.mszx). "
+           "Required output form for batch.\n");
+   fprintf(stream,
+           "      --continue-on-error       Skip a failed input instead of "
+           "aborting the batch.\n");
+   fprintf(stream,
+           "      --list                    Print a .mszx table of contents "
+           "and exit.\n");
+   fprintf(stream,
+           "      --no-index                Do not write the per-spectrum "
+           "index (written by default).\n");
+   fprintf(stream,
+           "      --query filter            With --list, print the indexed "
+           "spectra matching filter as TSV,\n"
+           "                                e.g. \"rt=600:660,ms_level=2,"
+           "precursor_mz=500:510\".\n");
+   fprintf(stream, "\n");
    fprintf(stream, "  -h, --help                    Show this help message.\n");
    fprintf(stream,
            "  -V, --version                 Show version information.\n\n");
@@ -227,6 +172,18 @@ static void print_usage(FILE* stream, int exit_code) {
            "specified, the "
            "output file name is the input file name with extension .msz.\n\n");
    exit(exit_code);
+}
+
+static int append_input(Arguments* arguments, char* path) {
+   char** tmp =
+       realloc(arguments->inputs, (arguments->n_inputs + 1) * sizeof(char*));
+   if (!tmp) {
+      fprintf(stderr, "Out of memory collecting input paths.\n");
+      return 1;
+   }
+   arguments->inputs = tmp;
+   arguments->inputs[arguments->n_inputs++] = path;
+   return 0;
 }
 
 static int parse_arguments(int argc, char* argv[], Arguments* arguments) {
@@ -377,6 +334,12 @@ static int parse_arguments(int argc, char* argv[], Arguments* arguments) {
             str++;
          }
          arguments->zstd_compression_level = num;
+      } else if (strcmp(argv[i], "--shuffle") == 0) {
+         arguments->shuffle = 1;
+         arguments->shuffle_explicit = 1;
+      } else if (strcmp(argv[i], "--no-shuffle") == 0) {
+         arguments->shuffle = 0;
+         arguments->shuffle_explicit = 1;
       } else if (strcmp(argv[i], "--list-algorithms") == 0) {
          if (arguments->json_output)
             print_algorithms_json();
@@ -400,21 +363,114 @@ static int parse_arguments(int argc, char* argv[], Arguments* arguments) {
                     MAX_SUPPORT);
          }
          exit(0);
-      } else if (arguments->input_file == NULL) {
-         arguments->input_file = argv[i];
-      } else if (arguments->output_file == NULL) {
-         arguments->output_file = argv[i];
+      } else if (strcmp(argv[i], "--batch") == 0) {
+         arguments->batch = 1;
+      } else if (strcmp(argv[i], "-r") == 0 ||
+                 strcmp(argv[i], "--recursive") == 0) {
+         arguments->recursive = 1;
+      } else if (strcmp(argv[i], "--continue-on-error") == 0) {
+         arguments->continue_on_error = 1;
+      } else if (strcmp(argv[i], "--list") == 0) {
+         arguments->list_mode = 1;
+      } else if (strcmp(argv[i], "--no-index") == 0) {
+         arguments->index = 0;
+      } else if (strcmp(argv[i], "--index") == 0) {
+         arguments->index = 1;
+      } else if (strcmp(argv[i], "--query") == 0) {
+         if (i + 1 >= argc) {
+            fprintf(stderr, "%s\n", "Missing filter for --query.");
+            return 1;
+         }
+         arguments->query = argv[++i];
+      } else if (strcmp(argv[i], "-o") == 0 ||
+                 strcmp(argv[i], "--output") == 0) {
+         if (i + 1 >= argc) {
+            fprintf(stderr, "%s\n", "Missing output path for -o/--output.");
+            return 1;
+         }
+         arguments->output_file = argv[++i];
+      } else if (strcmp(argv[i], "--from-file") == 0) {
+         if (i + 1 >= argc) {
+            fprintf(stderr, "%s\n", "Missing path for --from-file.");
+            return 1;
+         }
+         arguments->from_file = argv[++i];
       } else {
-         fprintf(stderr, "%s\n", "Too many arguments.");
-         return 1;
+         /* Positional. Collect every one into inputs[]; the first also seeds
+          * input_file for the single-file code paths. Output resolution
+          * (legacy 2nd positional vs -o vs batch default) happens in main(). */
+         if (append_input(arguments, argv[i])) return 1;
+         if (arguments->input_file == NULL) arguments->input_file = argv[i];
       }
    }
 
-   if (arguments->input_file == NULL) {
+   if (arguments->input_file == NULL && arguments->from_file == NULL) {
       fprintf(stderr, "%s\n", "Missing input file.");
       return 1;
    }
 
+   return 0;
+}
+
+/* Decide whether this invocation is a batch (folder/glob/list -> .mszx) request.
+ *
+ * Backward compatibility is the priority: the legacy two-positional form
+ * `mscompress input output` must NOT be treated as batch. The key disambiguator
+ * is that a batch needs 2+ *existing* input files, whereas in `input output`
+ * the second positional is an output path that does not exist yet. */
+/* Case-insensitive ".mzML" test, mirroring batch.c's input filter. */
+static int has_mzml_extension(const char* path) {
+   size_t pl = strlen(path);
+   if (pl < 5) return 0;
+   const char* ext = path + pl - 5;
+   const char* want = ".mzml";
+   for (size_t i = 0; i < 5; ++i) {
+      char c = ext[i];
+      if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+      if (c != want[i]) return 0;
+   }
+   return 1;
+}
+
+static int is_batch_request(Arguments* a) {
+   if (a->batch || a->from_file) return 1;
+
+   /* -o something.mszx forces archive output (single- or multi-input). */
+   if (a->output_file) {
+      size_t ol = strlen(a->output_file);
+      if (ol > 5 && strcmp(a->output_file + ol - 5, ".mszx") == 0) return 1;
+   }
+
+   /* Any directory or quoted-glob positional => batch. */
+   for (size_t i = 0; i < a->n_inputs; ++i) {
+      if (strpbrk(a->inputs[i], "*?[")) return 1;
+      struct stat st;
+      if (stat(a->inputs[i], &st) == 0 && (st.st_mode & S_IFMT) == S_IFDIR)
+         return 1;
+   }
+
+   /* 2+ existing regular-file *mzML* inputs (e.g. shell-expanded *.mzML)
+    * => batch.
+    *
+    * The extension test matters: in the legacy `mscompress input output` form
+    * the second positional is an output path, and it exists whenever the
+    * command is re-run or an existing file is being overwritten. Counting
+    * bare existence here silently flipped those invocations into batch mode.
+    *
+    * --extract is skipped entirely: its output is itself an .mzML, so the
+    * extension test cannot tell an existing output from a second input. */
+   if (a->n_inputs >= 2 && !a->extract_only) {
+      size_t existing_mzml = 0;
+      for (size_t i = 0; i < a->n_inputs; ++i) {
+         struct stat st;
+         if (stat(a->inputs[i], &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG &&
+             has_mzml_extension(a->inputs[i]))
+            existing_mzml++;
+      }
+      if (existing_mzml >= 2) return 1;
+   }
+
+   if (a->recursive) return 1;
    return 0;
 }
 
@@ -447,11 +503,50 @@ int main(int argc, char* argv[]) {
 
    prepare_threads(&arguments);  // Populate threads variable if not set.
 
+   // --list: print an .mszx table of contents (no decompression) and exit.
+   // With --query, print the matching rows of the spectrum index instead.
+   if (arguments.query && !arguments.list_mode) {
+      fprintf(stderr, "--query is used with --list.\n");
+      exit(1);
+   }
+   if (arguments.list_mode) {
+      if (!arguments.input_file) {
+         fprintf(stderr, "--list requires a .mszx input file.\n");
+         exit(1);
+      }
+      if (arguments.query)
+         exit(query_mszx(arguments.input_file, arguments.query) == 0 ? 0 : 1);
+      exit(list_mszx(arguments.input_file) == 0 ? 0 : 1);
+   }
+
+   // Batch mode: folder / glob / explicit list / --from-file -> one .mszx.
+   int is_batch = is_batch_request(&arguments);
+
+   // Extraction is single-file only. Without this, the extract_only override
+   // below turns COMPRESS_BATCH into EXTRACT with no input mapped.
+   if (is_batch && arguments.extract_only) {
+      fprintf(stderr, "%s\n", "--extract takes a single input file.");
+      exit(1);
+   }
+
+   // Legacy single-file forms: a second positional is the output path. Applies
+   // to compress/decompress/.mszx-decompress alike (batch ignores this: all
+   // positionals are inputs there).
+   if (!is_batch) {
+      if (arguments.output_file == NULL && arguments.n_inputs >= 2)
+         arguments.output_file = arguments.inputs[1];
+      if (arguments.n_inputs > 2) {
+         fprintf(stderr, "%s\n", "Too many arguments.");
+         exit(1);
+      }
+   }
+
    // Detect .mszx input — handled by a dedicated path that mmaps into the tar
    // and writes mzML + annotations into an output directory. Bypasses
-   // prepare_fds entirely.
+   // prepare_fds entirely. (Batch requests are always compress-to-.mszx, never
+   // .mszx decompression.)
    int is_mszx = 0;
-   if (arguments.input_file) {
+   if (!is_batch && arguments.input_file) {
       size_t ilen = strlen(arguments.input_file);
       if (ilen > 5 &&
           strcmp(arguments.input_file + ilen - 5, ".mszx") == 0) {
@@ -471,7 +566,12 @@ int main(int argc, char* argv[]) {
    }
 
    // Open file descriptors and mmap.
-   if (is_mszx) {
+   if (is_batch) {
+      // All positionals (+ --from-file) are inputs; output comes from -o or a
+      // default computed in compress_batch. Streams straight into the archive;
+      // no prepare_fds / input mmap here.
+      operation = COMPRESS_BATCH;
+   } else if (is_mszx) {
       operation = DECOMPRESS_MSZX;
       // Default output directory is the input path with ".mszx" stripped.
       if (arguments.output_file == NULL) {
@@ -610,10 +710,14 @@ int main(int argc, char* argv[]) {
          footer_t* footer = read_footer(input_map, input_filesize);
          if (!footer)
             exit(1);
+         /* Report the version even when this build cannot decode the file;
+            that is the answer --describe exists to give. */
+         int major = 0, minor = 0;
+         msz_read_version(input_map, input_filesize, &major, &minor);
          if (arguments.json_output)
-            print_footer_json(footer);
+            print_footer_json(footer, major, minor);
          else
-            print_footer_csv(footer);
+            print_footer_csv(footer, major, minor);
          break;
       };
       case DECOMPRESS_MSZX: {
@@ -621,6 +725,14 @@ int main(int argc, char* argv[]) {
                arguments.output_file);
          if (decompress_mszx(arguments.input_file, arguments.output_file,
                              &arguments)) {
+            error_status = 1;
+         }
+         break;
+      };
+      case COMPRESS_BATCH: {
+         // Batch compress: folder/glob/list -> one .mszx (Option A streaming).
+         // compress_batch owns its output file lifecycle (incl. cleanup).
+         if (compress_batch(&arguments)) {
             error_status = 1;
          }
          break;
@@ -645,7 +757,9 @@ int main(int argc, char* argv[]) {
    print("\n=== Operation finished in %1.4fs ===\n", abs_stop - abs_start);
 
    if (error_status) {
-      remove_file(arguments.output_file);
+      // compress_batch already cleans up its own (possibly defaulted) output.
+      if (operation != COMPRESS_BATCH)
+         remove_file(arguments.output_file);
       exit(1);
    }
 

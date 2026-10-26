@@ -6,6 +6,7 @@ from xml.etree.ElementTree import Element
 import numpy as np
 import numpy.typing as npt
 
+from .annotations import PSMTable
 from .types import AlgorithmInfo, SpectrumTransform
 
 class RuntimeArguments:
@@ -21,6 +22,7 @@ class RuntimeArguments:
     target_mz_format: int
     target_inten_format: int
     zstd_compression_level: int
+    shuffle: bool  # on by default
 
     def __init__(self) -> None: ...
 
@@ -401,6 +403,89 @@ class MSZFile(BaseFile):
         """
         ...
 
+class MSZXFile(MSZFile):
+    """First-class reader for MSZX (tar) archives.
+
+    Extends MSZFile so all spectrum properties and methods work directly on
+    the embedded MSZ payload, while adding access to the archive manifest and
+    the stored search results. Open via the `open()` classmethod.
+    """
+
+    _closed: bool
+
+    @classmethod
+    def open(cls, path: Union[str, PathLike]) -> "MSZXFile":
+        """Open an MSZX archive for reading.
+
+        Mmaps the embedded MSZ payload directly out of the archive (no temp
+        extraction) and eagerly reads the stored mzTab search results.
+
+        Args:
+            path: Path to the .mszx file.
+        """
+        ...
+
+    def close(self) -> None:
+        """Close the archive and release all resources. Idempotent."""
+        ...
+
+    @property
+    def manifest(self) -> Any:
+        """The archive manifest (`MSZXManifest`)."""
+        ...
+
+    @property
+    def archive_path(self) -> Any:
+        """Path to the MSZX archive."""
+        ...
+
+    @property
+    def psms(self) -> Optional[PSMTable]:
+        """The first stored PSMTable, or None if the archive has no search results."""
+        ...
+
+    @property
+    def psm_tables(self) -> Dict[str, PSMTable]:
+        """Every stored PSMTable, keyed by archive member name."""
+        ...
+
+    def get_psms(self, filename: str) -> PSMTable:
+        """The PSMTable stored under an archive member name."""
+        ...
+
+    @property
+    def annotation_files(self) -> list:
+        """List of annotation entries in the archive."""
+        ...
+
+    def describe(self) -> Dict[str, Any]:
+        """Description including the archive metadata."""
+        ...
+
+    def decompress(self, output: Union[str, PathLike]) -> MZMLFile:
+        """Decompress the embedded MSZ to mzML.
+
+        If `output` is an existing directory or has no file extension, the
+        mzML is written inside it as `<archive_stem>.mzML` and the search
+        results are written alongside as mzTab. Otherwise `output` is
+        treated as a single file path and only the mzML is written.
+        """
+        ...
+
+    def extract(self, output: str | PathLike, indicies: list[int] | None = ..., scan_numbers: list[int] | None = ..., ms_level: int | None = ...) -> "MSZXFile":
+        """Extract a subset of spectra and annotations to a new MSZX archive.
+
+        Args:
+            output: Path to the output .mszx file.
+            indicies: List of spectrum indices to extract.
+            scan_numbers: List of scan numbers to extract.
+            ms_level: Filter by MS level.
+
+        Returns:
+            New MSZXFile instance for the created archive.
+        """
+        ...
+
 class Spectrum:
     """Represents a single mass spectrum."""
 
@@ -528,3 +613,118 @@ def get_filesize(path: Union[str, bytes]) -> int:
 def list_algorithms() -> list[AlgorithmInfo]:
     """Return a list of available lossy algorithm descriptors from the C registry."""
     ...
+
+
+class MSZXBatchWriter:
+    """Incremental writer for a v2 multi-file ("batch") .mszx archive.
+
+    Wraps the same C writer the CLI drives, so an archive written from Python
+    is byte-identical to one the CLI produces from the same inputs and
+    settings. Entries stream straight into the archive file — no temp .msz
+    staging — which is why the output must be a seekable regular file.
+
+    The archive only becomes valid once `finish()` succeeds. Leaving the
+    `with` block via an exception calls `abort()`, removing the partial file.
+    """
+
+    def __init__(
+        self, path: Union[str, bytes, PathLike], index: bool = True, **kwargs: Any
+    ) -> None:
+        """Open an archive for writing.
+
+        Args:
+            path: Output .mszx path. Must be a seekable regular file.
+            index: Write the per-spectrum index (index.mszxi) that
+                `MSZXBatchFile.query()` reads. On by default.
+            **kwargs: Compression settings forwarded to RuntimeArguments
+                (threads, blocksize, mz_lossy, int_lossy, mz_scale_factor,
+                int_scale_factor, target_xml_format, target_mz_format,
+                target_inten_format, zstd_compression_level).
+        """
+        ...
+
+    def add(
+        self, source: Union[str, bytes, PathLike, MZMLFile], name: Optional[str] = None
+    ) -> int:
+        """Compress one mzML into the archive as a new entry.
+
+        Args:
+            source: mzML to compress. An already-open MZMLFile reuses its
+                existing mapping.
+            name: Entry name inside the archive. Defaults to
+                "<source basename minus .mzML>.msz"; collisions get __2, __3,
+                ... suffixes. Naming is handled by the C writer so the CLI and
+                every binding agree.
+
+        Returns:
+            Index of the new entry, for add_annotation/set_join_key.
+        """
+        ...
+
+    def add_annotation(
+        self,
+        entry_index: int,
+        data: bytes,
+        filename: str,
+        format: str = "tsv",
+        compressed: bool = False,
+        num_records: Optional[int] = None,
+    ) -> None:
+        """Attach an annotation file to a spectra entry, as its own member.
+
+        Compression is the caller's job — pass already-compressed bytes and
+        set `compressed=True`.
+        """
+        ...
+
+    def add_psms(
+        self,
+        entry_index: int,
+        source: Union[PSMTable, str, PathLike],
+        name: Optional[str] = None,
+        compressed: bool = True,
+    ) -> str:
+        """Attach search results to a spectra entry, stored as mzTab.
+
+        `source` is a `PSMTable` or a pepXML / Percolator / mzTab file;
+        returns the archive member name written.
+        """
+        ...
+
+    def set_join_key(self, entry_index: int, join_key: str) -> None:
+        """Set the column used to join annotations to spectra for one entry."""
+        ...
+
+    def set_description(self, description: str) -> None:
+        """Set an archive-level free-text description."""
+        ...
+
+    def set_extra(self, extra: dict) -> None:
+        """Set the archive-level `extra` metadata object."""
+        ...
+
+    def finish(self) -> None:
+        """Write manifest.json and the end-of-archive marker, then close.
+
+        On failure the partial archive is removed. The writer is unusable
+        afterwards either way.
+        """
+        ...
+
+    def abort(self) -> None:
+        """Discard the archive, removing the partial file. Idempotent."""
+        ...
+
+    @property
+    def path(self) -> Union[str, bytes]:
+        """Output archive path."""
+        ...
+
+    @property
+    def entries(self) -> list:
+        """Source paths added so far, in archive order."""
+        ...
+
+    def __len__(self) -> int: ...
+    def __enter__(self) -> "MSZXBatchWriter": ...
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool: ...

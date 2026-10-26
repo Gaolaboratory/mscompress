@@ -16,6 +16,10 @@ from libc.math cimport nan
 import math
 import re
 
+from mscompress.annotations import MzTab, PSMTable, read_psms
+from mscompress.annotations._io import compress
+from mscompress.types import AnnotationFormat, SpectrumTransform
+
 np.import_array()
 
 # Create a numpy dtype that matches C long (32-bit on Windows, typically 64-bit on Linux/Mac)
@@ -45,6 +49,179 @@ cdef void _python_warning_handler(const char* message) noexcept with gil:
 # Initialize callbacks when module is imported
 _set_error_callback(_python_error_handler)
 _set_warning_callback(_python_warning_handler)
+
+
+# ---------------------------------------------------------------------------
+# Spectrum-object cache sizing. Defined above any class that uses them as
+# default-arg values because Cython evaluates def-default values at
+# class-definition time, not at call time.
+# ---------------------------------------------------------------------------
+
+CACHE_SPECTRA_AUTO = -1
+"""Sentinel for ``cache_spectra`` meaning "use the bundled default".
+
+When passed (the default), ``Spectra`` keeps the last ``_DEFAULT_CACHE_SPECTRA``
+returned ``Spectrum`` objects in a bounded LRU. Repeated access to a cached
+index hands back the same ``Spectrum`` instance (so its lazily-loaded ``mz`` /
+``intensity`` / ``xml`` payloads survive). Pass ``cache_spectra=N`` for an
+explicit cap, or ``cache_spectra=0`` to disable eviction (legacy: the cache
+grows unboundedly, one entry per ever-accessed index)."""
+
+_DEFAULT_CACHE_SPECTRA = 128
+# Big enough that contiguous .mz/.intensity/.xml accesses on the same Spectrum
+# stay hot and typical ML batch sizes don't thrash; small enough that random
+# sampling can't pin tens of thousands of Spectrum objects.
+
+
+# ---------------------------------------------------------------------------
+# Shared, byte-budgeted decompressed-block cache.
+#
+# A single BlockCache can be shared across many open MSZ/MSZX files so that the
+# AGGREGATE decompressed-block memory obeys one ceiling, instead of each file
+# holding its own unbounded cache (which sums to hundreds of GB across a
+# multi-shard random-access dataloader). The cap is in BYTES, measured exactly
+# from each block's decompressed size.
+#
+# By default every file shares one process-wide BlockCache sized to
+# DEFAULT_CACHE_BYTES (overridable via MSCOMPRESS_CACHE_BYTES or
+# set_cache_budget()). Pass cache=BlockCache(n) to read() to use a private
+# pool, or cache=0 to opt out of bounding entirely (legacy unbounded). read()
+# is the only public entry point for the knob; the file constructors don't
+# expose it.
+# ---------------------------------------------------------------------------
+
+DEFAULT_CACHE_BYTES = 4 * 1024 * 1024 * 1024  # 4 GiB
+
+_default_block_cache = None
+
+
+cdef _resolve_default_budget():
+    env = os.environ.get("MSCOMPRESS_CACHE_BYTES")
+    if env:
+        try:
+            return int(env)
+        except (TypeError, ValueError):
+            warnings.warn(
+                f"Ignoring invalid MSCOMPRESS_CACHE_BYTES={env!r}; "
+                f"using {DEFAULT_CACHE_BYTES} bytes",
+                RuntimeWarning,
+            )
+    return DEFAULT_CACHE_BYTES
+
+
+cdef class BlockCache:
+    """A shared, byte-budgeted LRU over decompressed mz/intensity/xml blocks.
+
+    Pass one instance to several files (``read(path, cache=shared)``) and the
+    total decompressed-block memory they hold together is bounded by ``budget``
+    bytes; least-recently-used blocks are evicted (and re-decompressed on demand)
+    past the cap.
+
+    Args:
+        budget_bytes: Maximum total cached bytes. ``None`` resolves to the
+            process default (``MSCOMPRESS_CACHE_BYTES`` or ``DEFAULT_CACHE_BYTES``).
+    """
+    cdef block_lru_t* _lru
+    cdef readonly object budget
+
+    def __cinit__(self, budget_bytes=None):
+        if budget_bytes is None:
+            budget_bytes = _resolve_default_budget()
+        budget_bytes = int(budget_bytes)
+        if budget_bytes < 0:
+            raise ValueError("budget_bytes must be >= 0")
+        self.budget = budget_bytes
+        self._lru = _alloc_block_lru(<size_t>budget_bytes)
+
+    def __dealloc__(self):
+        if self._lru != NULL:
+            # Free any cache buffers still pinned, then the struct. Open files
+            # hold a Python ref to this BlockCache, so this only runs once no
+            # file references it — there are no live block pointers to dangle.
+            _lru_evict_all(self._lru)
+            _dealloc_block_lru(self._lru)
+            self._lru = NULL
+
+    @property
+    def usage(self):
+        """Current total decompressed bytes held across all sharing files."""
+        return _block_cache_usage(self._lru)
+
+    def clear(self):
+        """Evict every cached block (frees buffers; files re-decompress lazily)."""
+        if self._lru != NULL:
+            _lru_evict_all(self._lru)
+
+    def __repr__(self):
+        return (f"<BlockCache budget={self.budget} bytes "
+                f"usage={self.usage} bytes>")
+
+
+def get_default_cache():
+    """Return the process-wide default BlockCache, creating it on first use."""
+    global _default_block_cache
+    if _default_block_cache is None:
+        _default_block_cache = BlockCache(_resolve_default_budget())
+    return _default_block_cache
+
+
+def set_cache_budget(budget_bytes):
+    """Set the process-default block-cache budget (in bytes).
+
+    Installs a fresh default ``BlockCache`` of the given size. Files opened
+    afterward (without an explicit ``cache=``) share it. Files already open keep
+    the cache they were opened with. Call once at startup for predictable
+    behavior; under a multiprocessing DataLoader each worker has its own default,
+    so size for ``RAM_target / n_workers``.
+    """
+    global _default_block_cache
+    _default_block_cache = BlockCache(int(budget_bytes))
+    return _default_block_cache
+
+
+def get_cache_usage():
+    """Current bytes held by the process-default BlockCache (0 if unused)."""
+    if _default_block_cache is None:
+        return 0
+    return _default_block_cache.usage
+
+
+cdef _require_msz_version(void* mapping, long filesize):
+    """Refuse an .msz this build cannot decode.
+
+    Raised at open rather than at decompress() so the caller fails on the file
+    it named, instead of reading nonsense out of a footer it cannot interpret.
+    """
+    cdef int major = 0
+    cdef int minor = 0
+
+    if _msz_read_version(mapping, filesize, &major, &minor) != 0:
+        raise ValueError(
+            "unsupported msz format version %d.%d; this build supports %s-%s"
+            % (major, minor,
+               MIN_SUPPORT.decode('utf-8'), MAX_SUPPORT.decode('utf-8'))
+        )
+
+
+cdef BlockCache _coerce_cache(object cache):
+    """Resolve a user-supplied ``cache=`` argument to a BlockCache instance.
+
+    - None        -> the shared process default
+    - 0           -> None (opt out: unbounded legacy caching, no LRU)
+    - int > 0     -> a fresh private BlockCache of that byte budget
+    - BlockCache  -> used as-is (shared)
+    """
+    if cache is None:
+        return get_default_cache()
+    if isinstance(cache, BlockCache):
+        return <BlockCache>cache
+    if isinstance(cache, int):
+        if cache == 0:
+            return None
+        return BlockCache(cache)
+    raise TypeError(
+        "cache must be a BlockCache, an int byte-budget, 0 to disable, or None"
+    )
 
 
 def _pipe_stream(c_func, args, chunk_size=1_048_576):
@@ -116,6 +293,8 @@ cdef class RuntimeArguments:
         self._arguments.target_mz_format = _ZSTD_compression_
         self._arguments.target_inten_format = _ZSTD_compression_
         self._arguments.zstd_compression_level = 3
+        self._arguments.shuffle = 1
+        self._arguments.shuffle_explicit = 0
 
     cdef Arguments* get_ptr(self):
         return &self._arguments
@@ -137,6 +316,22 @@ cdef class RuntimeArguments:
             return self._arguments.blocksize
         def __set__(self, value):
             self._arguments.blocksize = value
+
+    property shuffle:
+        """Byte-shuffle binary arrays before compressing them. On by default.
+
+        Lossless and recorded in the file, so a shuffled .msz decompresses
+        without the reader opting in. Applies only to losslessly stored
+        streams; skipped for any stream using a lossy algorithm. Set False to
+        write an archive an 0.1-only reader can still read.
+        """
+        def __get__(self):
+            return self._arguments.shuffle != 0
+        def __set__(self, value):
+            self._arguments.shuffle = 1 if value else 0
+            # Setting the property counts as asking, which is what decides
+            # whether the lossy-stream warnings fire.
+            self._arguments.shuffle_explicit = 1
 
     property mz_scale_factor:
         def __get__(self):
@@ -681,7 +876,7 @@ cdef class MZMLFile(BaseFile):
         mapping_ptr = <char*>self._mapping
         mapping_ptr += start
 
-        self._df.decode_source_compression_mz_fun(self._z, mapping_ptr, end - start, &dest, &out_len, tmp)
+        self._df.decode_source_compression_mz_fun(self._z_inflate, mapping_ptr, end - start, &dest, &out_len, tmp)
         decode_output = dest  # Save pointer to decode function's allocation
 
         dest += ZLIB_SIZE_OFFSET # Skip zlib header
@@ -733,7 +928,7 @@ cdef class MZMLFile(BaseFile):
         mapping_ptr = <char*>self._mapping
         mapping_ptr += start
 
-        self._df.decode_source_compression_inten_fun(self._z, mapping_ptr, end - start, &dest, &out_len, tmp)
+        self._df.decode_source_compression_inten_fun(self._z_inflate, mapping_ptr, end - start, &dest, &out_len, tmp)
         decode_output = dest  # Save pointer to decode function's allocation
 
         dest += ZLIB_SIZE_OFFSET # Skip zlib header
@@ -801,22 +996,120 @@ cdef class MSZFile(BaseFile):
     cdef block_len_queue_t* _xml_block_lens
     cdef block_len_queue_t* _mz_binary_block_lens
     cdef block_len_queue_t* _inten_binary_block_lens
+    cdef BlockCache _block_cache   # shared/owned decompressed-block cache;
+                                   # None disables bounding (legacy unbounded)
+    # Prefix sum of per-division spectrum counts (length n_divisions+1) used to
+    # resolve a global spectrum index -> (division, local index) WITHOUT
+    # materializing the flattened per-spectrum position arrays. _positions (the
+    # flattened division) is now built lazily, only if .positions/.describe()
+    # are accessed. This is the ~22.6 GB/90-shard metadata saving.
+    cdef long* _div_spec_offsets
 
     def __init__(self, bytes path):
         super(MSZFile, self).__init__(path)
+        self._block_cache = _coerce_cache(None)  # read() may override
+        self._div_spec_offsets = NULL
+        _require_msz_version(self._mapping, self.filesize)
         self._df = _get_header_df(self._mapping)
         self._footer = _read_footer(self._mapping, self.filesize)
         self._divisions = _read_divisions(self._mapping, self._footer.divisions_t_pos, self._footer.n_divisions)
-        self._positions = _flatten_divisions(self._divisions)
+        self._positions = NULL  # built lazily via _ensure_positions()
+        self._build_offsets()
         self._dctx = _alloc_dctx()
         self._xml_block_lens = _read_block_len_queue(self._mapping, self._footer.xml_blk_pos, self._footer.mz_binary_blk_pos)
         self._mz_binary_block_lens = _read_block_len_queue(self._mapping, self._footer.mz_binary_blk_pos, self._footer.inten_binary_blk_pos)
         self._inten_binary_block_lens = _read_block_len_queue(self._mapping, self._footer.inten_binary_blk_pos, self._footer.divisions_t_pos)
         _set_decompress_runtime_variables(self._df, self._footer)
 
+    cdef block_lru_t* _lru_ptr(self):
+        """The shared LRU pointer for extract calls, or NULL if bounding is
+        disabled (cache=0)."""
+        if self._block_cache is None:
+            return NULL
+        return self._block_cache._lru
+
+    def _set_block_cache(self, cache):
+        """Install the block cache, coercing None/int/0/BlockCache the same way
+        the old ``cache=`` constructor argument did. Used by ``read()``, which
+        is the only public entry point for the knob. Must be called before any
+        spectrum/block access so no blocks are attached under the old cache."""
+        self._block_cache = _coerce_cache(cache)
+
+    cdef void _build_offsets(self):
+        """Build the per-division spectrum-count prefix sum so a global index
+        resolves to (division, local) in O(log n_divisions) without flattening
+        the per-spectrum position arrays into one contiguous heap copy."""
+        cdef int n = self._divisions.n_divisions
+        self._div_spec_offsets = <long*>malloc(sizeof(long) * (n + 1))
+        if self._div_spec_offsets == NULL:
+            raise MemoryError("MSZFile._build_offsets: malloc failed")
+        cdef long acc = 0
+        cdef int i
+        for i in range(n):
+            self._div_spec_offsets[i] = acc
+            acc += self._divisions.divisions[i].mz.total_spec
+        self._div_spec_offsets[n] = acc
+
+    cdef int _resolve_division(self, size_t index, size_t* local) except -1:
+        """Resolve a global spectrum index to its division index, writing the
+        in-division offset to *local. Binary search over the prefix sum."""
+        cdef int lo = 0
+        cdef int hi = self._divisions.n_divisions - 1
+        cdef int mid
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if <size_t>self._div_spec_offsets[mid] <= index:
+                lo = mid
+            else:
+                hi = mid - 1
+        local[0] = index - <size_t>self._div_spec_offsets[lo]
+        return lo
+
+    cdef int _spectrum_meta(self, size_t index, uint32_t* scan,
+                            uint16_t* ms_level, float* ret_time,
+                            bint* has_rt) except -1:
+        """Per-spectrum metadata for the given global index, read straight from
+        the mmap-backed per-division scan/ms_level arrays (no flattened copy).
+        MSZ stores no per-spectrum retention times, so has_rt is always 0."""
+        cdef size_t local = 0
+        cdef int d = self._resolve_division(index, &local)
+        cdef division_t* div = self._divisions.divisions[d]
+        scan[0] = div.scans[local]
+        ms_level[0] = div.ms_levels[local]
+        has_rt[0] = False
+        return 0
+
+    cdef void _ensure_positions(self):
+        """Materialize the flattened position arrays on demand (only when
+        .positions / describe() need a contiguous Division). Cached thereafter."""
+        if self._positions == NULL:
+            self._positions = _flatten_divisions(self._divisions)
+
     @staticmethod
     def _reopen(path: bytes):
         return MSZFile(path)
+
+    @property
+    def block_cache(self):
+        """The shared ``BlockCache`` bounding this file's decompressed blocks,
+        or ``None`` if bounding is disabled (opened with ``cache=0``)."""
+        return self._block_cache
+
+    def clear_cache(self):
+        """Evict this file's decompressed blocks from the shared cache.
+
+        Frees the per-block buffers held on this file's behalf without closing
+        the file; subsequent reads re-decompress on demand. No-op when bounding
+        is disabled (``cache=0``)."""
+        cdef block_lru_t* lru = self._lru_ptr()
+        if lru == NULL:
+            return
+        if self._xml_block_lens != NULL:
+            _lru_remove_queue_blocks(lru, self._xml_block_lens)
+        if self._mz_binary_block_lens != NULL:
+            _lru_remove_queue_blocks(lru, self._mz_binary_block_lens)
+        if self._inten_binary_block_lens != NULL:
+            _lru_remove_queue_blocks(lru, self._inten_binary_block_lens)
 
     def _init_from_archive(self, bytes mszx_path, bytes entry_name):
         """
@@ -858,18 +1151,24 @@ cdef class MSZFile(BaseFile):
         self.filesize = sz
         self._opened_from_archive = True
         self._spectra = None
+        self._cache_spectra = CACHE_SPECTRA_AUTO  # read() may override
+        self._block_cache = _coerce_cache(None)   # read() may override
         self._arguments = RuntimeArguments()
         self._z = _alloc_z_stream()
+        self._z_inflate = _alloc_z_stream_inflate()
         self.output_fd = -1
         self._df = NULL
         self._divisions = NULL
         self._positions = NULL
+        self._div_spec_offsets = NULL
 
         # Run the MSZFile-specific init body.
+        _require_msz_version(self._mapping, self.filesize)
         self._df = _get_header_df(self._mapping)
         self._footer = _read_footer(self._mapping, self.filesize)
         self._divisions = _read_divisions(self._mapping, self._footer.divisions_t_pos, self._footer.n_divisions)
-        self._positions = _flatten_divisions(self._divisions)
+        self._positions = NULL  # built lazily via _ensure_positions()
+        self._build_offsets()
         self._dctx = _alloc_dctx()
         self._xml_block_lens = _read_block_len_queue(self._mapping, self._footer.xml_blk_pos, self._footer.mz_binary_blk_pos)
         self._mz_binary_block_lens = _read_block_len_queue(self._mapping, self._footer.mz_binary_blk_pos, self._footer.inten_binary_blk_pos)
@@ -909,6 +1208,26 @@ cdef class MSZFile(BaseFile):
         if self._dctx != NULL:
             ZSTD_freeDCtx(self._dctx)
             self._dctx = NULL
+
+        # Free the division prefix-sum table.
+        if self._div_spec_offsets != NULL:
+            free(self._div_spec_offsets)
+            self._div_spec_offsets = NULL
+
+        # Detach this file's blocks from the shared cache BEFORE freeing the
+        # queues, or the shared LRU would retain dangling pointers into freed
+        # nodes. This also frees any cache buffers those blocks still hold and
+        # decrements the cache's byte usage. Safe when cache is disabled (None).
+        cdef block_lru_t* lru = self._lru_ptr()
+        if lru != NULL:
+            if self._xml_block_lens != NULL:
+                _lru_remove_queue_blocks(lru, self._xml_block_lens)
+            if self._mz_binary_block_lens != NULL:
+                _lru_remove_queue_blocks(lru, self._mz_binary_block_lens)
+            if self._inten_binary_block_lens != NULL:
+                _lru_remove_queue_blocks(lru, self._inten_binary_block_lens)
+        # Drop our reference to the shared cache (it outlives us if shared).
+        self._block_cache = None
 
         # Free block length queues
         if self._xml_block_lens != NULL:
@@ -1142,7 +1461,7 @@ cdef class MSZFile(BaseFile):
         cdef double* double_ptr
         cdef float* float_ptr
 
-        res = _extract_spectrum_mz(<char*> self._mapping, self._dctx, self._df, self._mz_binary_block_lens, self._footer.mz_binary_pos, self._divisions, index, &out_len, FALSE)
+        res = _extract_spectrum_mz(<char*> self._mapping, self._dctx, self._df, self._mz_binary_block_lens, self._footer.mz_binary_pos, self._divisions, index, &out_len, FALSE, self._lru_ptr())
 
         if res == NULL:
             raise ValueError(f"Failed to extract m/z binary for index {index}")
@@ -1181,7 +1500,7 @@ cdef class MSZFile(BaseFile):
         cdef double* double_ptr
         cdef float* float_ptr
 
-        res = _extract_spectrum_inten(<char*> self._mapping, self._dctx, self._df, self._inten_binary_block_lens, self._footer.inten_binary_pos, self._divisions, index, &out_len, FALSE)
+        res = _extract_spectrum_inten(<char*> self._mapping, self._dctx, self._df, self._inten_binary_block_lens, self._footer.inten_binary_pos, self._divisions, index, &out_len, FALSE, self._lru_ptr())
 
         if res == NULL:
             raise ValueError(f"Failed to extract intensity binary for index {index}")
@@ -1228,7 +1547,8 @@ cdef class MSZFile(BaseFile):
             <char*>self._mapping, self._dctx, self._df,
             self._xml_block_lens, self._mz_binary_block_lens,
             self._inten_binary_block_lens, xml_pos, mz_pos,
-            inten_pos, mz_fmt, inten_fmt, self._divisions, index, &out_len
+            inten_pos, mz_fmt, inten_fmt, self._divisions, index, &out_len,
+            self._lru_ptr()
         )
 
         if res == NULL:
@@ -1316,9 +1636,8 @@ cdef class MSZXFile(MSZFile):
     directory-output mzML+annotations respectively.
     """
     cdef object _manifest                # MSZXManifest
-    cdef dict _annotations               # {filename: PSMReader}
+    cdef dict _psm_tables                # {filename: PSMTable}
     cdef object _archive_path            # pathlib.Path
-    cdef object _primary_annotation_reader
     cdef public bint _closed             # idempotent-close guard (visible to Python)
 
     @classmethod
@@ -1334,13 +1653,10 @@ cdef class MSZXFile(MSZFile):
         Args:
             path: Path to the .mszx file.
         """
-        # Local imports break the circular module load between _core and
-        # the Python-side annotation/tarfile machinery (mscompress.mszx
-        # re-exports MSZXFile from _core, so it can't be imported eagerly
-        # at the top of this file).
+        # mscompress.mszx imports MSZXFile from _core, so importing it at
+        # the top of this file would be circular.
         import tarfile
         import warnings
-        from mscompress.annotations import PSMReader, MSZXAnnotationFile
         from mscompress.mszx.metadata import MSZXManifest
 
         archive_path = Path(path)
@@ -1359,24 +1675,26 @@ cdef class MSZXFile(MSZFile):
 
             manifest = MSZXManifest.from_json(manifest_file.read().decode("utf-8"))
 
-            annotation_readers = {}
+            psm_tables = {}
             for entry in manifest.annotations:
-                try:
-                    member = tar.getmember(entry.filename)
-                    mszx_source = MSZXAnnotationFile(
-                        mszx_file=tar,
-                        member=member,
-                        name=entry.filename,
+                if entry.format != AnnotationFormat.MZTAB:
+                    warnings.warn(
+                        f"Skipping annotation '{entry.filename}': only mzTab "
+                        f"search results are read (format is {entry.format.value!r})",
+                        UserWarning,
+                        stacklevel=2,
                     )
-                    reader = PSMReader(mszx_source)
-                    annotation_readers[entry.filename] = reader
+                    continue
+                try:
+                    handle = tar.extractfile(tar.getmember(entry.filename))
+                    psm_tables[entry.filename] = MzTab().read(handle.read())
                 except KeyError:
                     warnings.warn(
                         f"Annotation file '{entry.filename}' not found in archive",
                         UserWarning,
                         stacklevel=2,
                     )
-                except (ValueError, Exception) as e:
+                except Exception as e:
                     warnings.warn(
                         f"Could not parse annotation file '{entry.filename}': {e}",
                         UserWarning,
@@ -1390,11 +1708,8 @@ cdef class MSZXFile(MSZFile):
             manifest.spectra_file.encode(),
         )
         self._manifest = manifest
-        self._annotations = annotation_readers
+        self._psm_tables = psm_tables
         self._archive_path = archive_path
-        self._primary_annotation_reader = (
-            next(iter(annotation_readers.values())) if annotation_readers else None
-        )
         self._closed = False
         return self
 
@@ -1416,8 +1731,7 @@ cdef class MSZXFile(MSZFile):
         self._closed = True
         # Drop Python references so the underlying data can be GC'd before
         # the C resources are torn down by the parent.
-        self._annotations = None
-        self._primary_annotation_reader = None
+        self._psm_tables = None
         self._manifest = None
         MSZFile._cleanup(self)
 
@@ -1432,33 +1746,25 @@ cdef class MSZXFile(MSZFile):
         return self._archive_path
 
     @property
-    def annotations(self):
-        """Primary annotation reader, or None if no annotations."""
-        return self._primary_annotation_reader
+    def psms(self):
+        """The first stored PSMTable, or None if the archive has no search results."""
+        return next(iter(self._psm_tables.values()), None)
 
     @property
-    def annotation_readers(self):
-        """Dict of all annotation readers, keyed by filename."""
-        return self._annotations
+    def psm_tables(self):
+        """Every stored PSMTable, keyed by archive member name."""
+        return self._psm_tables
+
+    def get_psms(self, filename):
+        """The PSMTable stored under an archive member name."""
+        if filename in self._psm_tables:
+            return self._psm_tables[filename]
+        raise KeyError(f"Search results not found: {filename}")
 
     @property
     def annotation_files(self):
         """List of annotation entries in the archive."""
         return self._manifest.annotations
-
-    def get_annotation_reader(self, filename):
-        """Get the annotation reader for a specific file by name."""
-        if filename in self._annotations:
-            return self._annotations[filename]
-        raise KeyError(f"Annotation file not found: {filename}")
-
-    def get_annotation_readers_by_format(self, format):
-        """Get all annotation readers matching a specific format."""
-        return [
-            self._annotations[entry.filename]
-            for entry in self._manifest.annotations
-            if entry.format == format and entry.filename in self._annotations
-        ]
 
     def describe(self):
         """Description including the archive metadata."""
@@ -1474,9 +1780,9 @@ cdef class MSZXFile(MSZFile):
         Decompress the embedded MSZ to mzML.
 
         If `output` is an existing directory or has no file extension, the
-        mzML is written inside it as `<archive_stem>.mzML` and any cached
-        annotation readers are written alongside (using the entry's name
-        with any trailing `.zst` suffix stripped). Otherwise, `output` is
+        mzML is written inside it as `<archive_stem>.mzML` and the search
+        results are written alongside as mzTab (using the entry's name with
+        any trailing `.zst` suffix stripped). Otherwise, `output` is
         treated as a single file path and only the mzML is written.
         """
         out_path = Path(os.fspath(output))
@@ -1489,9 +1795,9 @@ cdef class MSZXFile(MSZFile):
         mzml_path = out_path / f"{self._archive_path.stem}.mzML"
         result = MSZFile.decompress(self, mzml_path)
 
-        for filename, reader in self._annotations.items():
+        for filename, table in self._psm_tables.items():
             out_name = filename[:-4] if filename.endswith(".zst") else filename
-            (out_path / out_name).write_bytes(reader.source.read())
+            MzTab().write(table, out_path / out_name)
 
         return result
 
@@ -1512,7 +1818,6 @@ cdef class MSZXFile(MSZFile):
         import tempfile
         import warnings
         from mscompress.mszx import MSZXBuilder
-        from mscompress.annotations import PSMReader
 
         output_path = Path(output)
         if not output_path.suffix:
@@ -1575,17 +1880,9 @@ cdef class MSZXFile(MSZFile):
                 for k, v in self._manifest.extra.items():
                     builder.set_extra(k, v)
 
-                for filename, reader in self._annotations.items():
-                    fname_path = Path(filename)
-                    temp_filename = fname_path.stem if fname_path.suffix.lower() == ".zst" else filename
-                    temp_ann_path = temp_path / temp_filename
-
-                    try:
-                        reader.filter_to_file(temp_ann_path, target_scans)
-                        new_reader = PSMReader(temp_ann_path)
-                        builder.add_annotations(new_reader)
-                    except Exception as e:
-                        warnings.warn(f"Failed to filter annotation {filename}: {e}")
+                for filename, table in self._psm_tables.items():
+                    name = filename[:-4] if filename.endswith(".zst") else filename
+                    builder.add_psms(table.filter_scans(target_scans), name=name)
 
                 builder.save(output_path)
             finally:
@@ -1627,8 +1924,16 @@ cdef class BaseFile:
     cdef divisions_t* _divisions
     cdef division_t* _positions
     cdef Spectra _spectra
+    cdef public int _cache_spectra  # Cap forwarded to Spectra; CACHE_SPECTRA_AUTO
+                                    # (-1) by default. Set by read() before the
+                                    # first .spectra access; public so the
+                                    # pure-Python read() factory can assign it.
     cdef RuntimeArguments _arguments
     cdef z_stream* _z
+    cdef z_stream* _z_inflate  # Dedicated inflate stream: _z is deflate-
+                               # initialized and must never be fed to
+                               # zlib_decompress (init once, inflateReset
+                               # per block inside zlib_decompress).
     cdef int output_fd
 
 
@@ -1643,13 +1948,42 @@ cdef class BaseFile:
         self._map_length = self.filesize
         self._opened_from_archive = False
         self._spectra = None
+        self._cache_spectra = CACHE_SPECTRA_AUTO  # read() may override
         self._arguments = RuntimeArguments()
         self._z = _alloc_z_stream()
+        self._z_inflate = _alloc_z_stream_inflate()
         self.output_fd = -1
         # Initialize pointers to NULL to prevent undefined behavior
         self._df = NULL
         self._divisions = NULL
         self._positions = NULL
+
+    cdef void _ensure_positions(self):
+        """Ensure self._positions (the flattened Division) is materialized.
+
+        Default: a no-op — subclasses whose _positions is populated at open
+        (e.g. MZMLFile from scan_mzml) need nothing. MSZFile overrides this to
+        flatten lazily, since it now resolves spectrum metadata without the
+        flattened arrays."""
+        pass
+
+    cdef int _spectrum_meta(self, size_t index, uint32_t* scan,
+                            uint16_t* ms_level, float* ret_time,
+                            bint* has_rt) except -1:
+        """Per-spectrum metadata (scan number, MS level, retention time) for a
+        global index. Default reads from the flat self._positions division;
+        MSZFile overrides to read from the mmap-backed per-division arrays
+        without flattening. has_rt=0 means no retention time (caller uses NaN)."""
+        if self._positions == NULL:
+            raise RuntimeError("_spectrum_meta: positions unavailable")
+        scan[0] = self._positions.scans[index]
+        ms_level[0] = self._positions.ms_levels[index]
+        if self._positions.ret_times != NULL:
+            ret_time[0] = self._positions.ret_times[index]
+            has_rt[0] = True
+        else:
+            has_rt[0] = False
+        return 0
 
 
     def __enter__(self):
@@ -1704,6 +2038,11 @@ cdef class BaseFile:
             _dealloc_z_stream(self._z)
             self._z = NULL
 
+        # Free zlib inflate z_stream
+        if self._z_inflate != NULL:
+            _dealloc_z_stream_inflate(self._z_inflate)
+            self._z_inflate = NULL
+
         # Free data_format_t
         if self._df != NULL:
             _dealloc_df(self._df)
@@ -1729,11 +2068,24 @@ cdef class BaseFile:
     @property
     def spectra(self):
         if self._spectra is None:
-            self._spectra = Spectra(self, DataFormat.from_ptr(self._df), Division.from_ptr(self._positions))
+            # Spectra resolves per-spectrum metadata via _spectrum_meta(), so it
+            # does NOT need the flattened Division. Pass it only if already
+            # materialized (MZMLFile); MSZFile keeps _positions lazy/NULL here.
+            positions_div = (Division.from_ptr(self._positions)
+                             if self._positions != NULL else None)
+            self._spectra = Spectra(
+                self,
+                DataFormat.from_ptr(self._df),
+                positions_div,
+                cap=self._cache_spectra,
+            )
         return self._spectra
-    
+
     @property
     def positions(self):
+        # Materializes the flattened Division on demand (MSZFile). For mzML it
+        # is already populated, so this is a no-op there.
+        self._ensure_positions()
         return Division.from_ptr(self._positions)
 
     @property
@@ -1767,6 +2119,7 @@ cdef class BaseFile:
         raise NotImplementedError("This method should be overridden in subclasses")
 
     def describe(self) -> dict:
+        self._ensure_positions()
         return {
             "path": self.path,
             "filesize": self.filesize,
@@ -1938,21 +2291,34 @@ cdef class Spectra:
 
     __len__(self) -> int:
         Returns the total number of spectra.
+
+    clear_cache(self):
+        Drop all cached ``Spectrum`` objects (and any payloads they lazily loaded).
+
+    cache_cap (property):
+        The effective LRU cap. 0 means unbounded; positive ints are the maximum
+        number of ``Spectrum`` objects held at once.
     """
     cdef BaseFile _f
     cdef object _df
     cdef object _positions
-    cdef object _cache  # Store computed spectra
+    cdef object _cache  # dict[size_t, Spectrum] — insertion-ordered LRU
+    cdef int _cap       # 0 = unbounded; positive = bounded
     cdef int _index
     cdef size_t length
     cdef object _transform
 
-    def __init__(self, BaseFile f, DataFormat df, Division positions):
+    def __init__(self, BaseFile f, DataFormat df, Division positions,
+                 int cap=CACHE_SPECTRA_AUTO):
         self._f = f
         self._df = df
         self._positions = positions
         self.length = self._df.source_total_spec
-        self._cache = [None] * self.length  # Initialize cache
+        self._cache = {}
+        if cap == CACHE_SPECTRA_AUTO:
+            self._cap = _DEFAULT_CACHE_SPECTRA
+        else:
+            self._cap = cap if cap > 0 else 0
         self._index = 0
         self._transform = None
 
@@ -1972,21 +2338,65 @@ cdef class Spectra:
         if index >= self.length:
             raise IndexError("Spectra index out of range")
 
-        if self._cache[index] is None:
-            self._cache[index] = self._compute_spectrum(index)
+        # LRU hit: bump to most-recently-used by reinserting at the dict tail.
+        # Python 3.7+ dicts preserve insertion order, which gives LRU ordering
+        # for free (oldest = first iter, newest = last insertion).
+        if index in self._cache:
+            sp = self._cache.pop(index)
+            self._cache[index] = sp
+            return sp
 
-        return self._cache[index]
+        sp = self._compute_spectrum(index)
+        self._cache[index] = sp
+
+        # Evict oldest while over cap. cap=0 means unbounded — never evict.
+        if self._cap > 0:
+            while len(self._cache) > self._cap:
+                oldest = next(iter(self._cache))
+                del self._cache[oldest]
+
+        return sp
+
+    @property
+    def cache_cap(self):
+        """The effective LRU cap. 0 means unbounded; positive ints are the
+        maximum number of ``Spectrum`` objects held at once."""
+        return self._cap
+
+    @property
+    def cache_size(self):
+        """Number of ``Spectrum`` objects currently held in the cache."""
+        return len(self._cache)
+
+    def _has_cached(self, size_t index):
+        """True if ``index`` is currently resident in the object cache.
+        Primarily for tests/introspection; does not affect LRU ordering."""
+        return index in self._cache
+
+    def clear_cache(self):
+        """Drop all cached ``Spectrum`` objects.
+
+        Subsequent ``spectra[i]`` calls construct fresh objects and re-fetch
+        their ``mz`` / ``intensity`` / ``xml`` lazily. The file stays open.
+        Does not touch any C-level block cache.
+        """
+        self._cache.clear()
 
     cdef Spectrum _compute_spectrum(self, size_t index):
-        if self._positions.ret_times is not None:
-            retention_time = self._positions.ret_times[index]
-        else:
-            retention_time = nan("1")
+        # Pull metadata via the file's resolver instead of a flattened position
+        # array. For MSZ this reads the mmap-backed per-division scan/ms_level
+        # arrays directly (no 22.6 GB/90-shard flatten); for mzML it reads the
+        # scan division populated at open.
+        cdef uint32_t scan = 0
+        cdef uint16_t ms_level = 0
+        cdef float ret_time = 0.0
+        cdef bint has_rt = False
+        self._f._spectrum_meta(index, &scan, &ms_level, &ret_time, &has_rt)
         return Spectrum(
             index=index,
-            scan=self._positions.scans[index],
-            ms_level=self._positions.ms_levels[index],
-            retention_time=retention_time,
+            scan=scan,
+            ms_level=ms_level,
+            retention_time=(ret_time if has_rt else nan("1")),
             file=self._f,
             transform=self._transform
         )
@@ -2004,7 +2414,6 @@ cdef class Spectra:
             transform: A callable matching the SpectrumTransform protocol,
                        or None to clear the transform.
         """
-        from mscompress.types import SpectrumTransform
         if transform is not None and not isinstance(transform, SpectrumTransform):
             raise TypeError(
                 "transform must be a callable with signature "
@@ -2012,7 +2421,7 @@ cdef class Spectra:
             )
         self._transform = transform
         # Invalidate cache so spectra are recomputed with new transform
-        self._cache = [None] * self.length
+        self._cache.clear()
 
     def with_transform(self, transform):
         """Return a new Spectra instance with the given transform applied.
@@ -2026,7 +2435,7 @@ cdef class Spectra:
         Returns:
             A new Spectra instance with the transform set.
         """
-        new = Spectra(self._f, self._df, self._positions)
+        new = Spectra(self._f, self._df, self._positions, cap=self._cap)
         new.set_transform(transform)
         return new
 
@@ -2179,3 +2588,281 @@ def get_filesize(path: Union[str, bytes]) -> int:
         raise FileNotFoundError(f"File not found: {path}")
     
     return _get_filesize(path)
+
+
+cdef class MSZXBatchWriter:
+    """
+    Incremental writer for a v2 multi-file ("batch") .mszx archive.
+
+    Wraps the same C writer the CLI drives, so an archive written from Python
+    is byte-identical to one the CLI produces from the same inputs and
+    settings. Each entry streams straight into the archive file — no temp .msz
+    staging — which is why the output must be a seekable regular file.
+
+    The archive only becomes valid once `finish()` succeeds: it writes
+    manifest.json and the end-of-archive marker. Leaving the `with` block via
+    an exception calls `abort()`, removing the partial archive.
+
+    Parameters:
+    path (Union[str, bytes, PathLike]): Output .mszx path.
+    index (bool): Write the per-spectrum index (index.mszxi) that
+        `MSZXBatchFile.query()` reads. On by default.
+    **kwargs: Compression settings forwarded to RuntimeArguments (threads,
+        blocksize, mz_lossy, int_lossy, mz_scale_factor, int_scale_factor,
+        target_xml_format, target_mz_format, target_inten_format,
+        zstd_compression_level).
+
+    Example:
+        with MSZXBatchWriter("cohort.mszx", threads=8) as w:
+            idx = w.add("run1.mzML")
+            w.add_psms(idx, "run1.pin")   # stored as run1.pin.mztab.zst
+    """
+
+    cdef batch_writer_t* _writer
+    cdef RuntimeArguments _arguments
+    cdef object _path
+    cdef list _entries
+    cdef bint _finished
+
+    def __cinit__(self):
+        self._writer = NULL
+        self._finished = False
+
+    def __init__(self, path, index=True, **kwargs):
+        self._path = os.fspath(path)
+        if isinstance(self._path, str):
+            path_bytes = self._path.encode("utf-8")
+        else:
+            path_bytes = self._path
+
+        self._arguments = RuntimeArguments()
+        for key, value in kwargs.items():
+            if not hasattr(self._arguments, key):
+                raise TypeError(f"Unknown compression setting: {key!r}")
+            setattr(self._arguments, key, value)
+
+        self._entries = []
+        self._writer = _batch_writer_open(path_bytes)
+        if self._writer == NULL:
+            raise OSError(
+                f"Could not open .mszx archive for writing: {os.fsdecode(path_bytes)} "
+                f"(the output must be a seekable regular file, not a pipe)"
+            )
+        if not index:
+            _batch_writer_set_index(self._writer, 0)
+
+    def __dealloc__(self):
+        # An un-finished writer left to the GC would otherwise leak the fd and
+        # strand a partial archive on disk.
+        if self._writer != NULL:
+            _batch_writer_abort(self._writer)
+            self._writer = NULL
+
+    cdef _check_open(self):
+        if self._writer == NULL:
+            raise ValueError("Operation on a finished or aborted MSZXBatchWriter")
+
+    def add(self, source, name=None) -> int:
+        """
+        Compress one mzML into the archive as a new entry.
+
+        Parameters:
+        source (Union[str, bytes, PathLike, MZMLFile]): mzML to compress. An
+            already-open MZMLFile reuses its existing mapping.
+        name (Optional[str]): Entry name inside the archive. Defaults to
+            "<source basename minus .mzML>.msz"; collisions get __2, __3, ...
+            suffixes. Naming is handled by the C writer so the CLI and every
+            binding agree.
+
+        Returns:
+        int: Index of the new entry, for use with add_annotation/set_join_key.
+        """
+        self._check_open()
+
+        cdef bytes name_bytes = name.encode("utf-8") if isinstance(name, str) else name
+        cdef const char* name_ptr = <const char*>name_bytes if name_bytes is not None else NULL
+
+        cdef void* mapping
+        cdef size_t filesize
+        cdef int fd = -1
+        cdef bytes src_bytes
+        cdef const char* src_ptr
+        cdef int idx
+        cdef Arguments* args = self._arguments.get_ptr()
+        cdef MZMLFile mzml
+
+        if isinstance(source, MZMLFile):
+            mzml = <MZMLFile>source
+            mapping = mzml._mapping
+            filesize = mzml.filesize
+            src_bytes = mzml._path
+            if mapping == NULL:
+                raise ValueError("MZMLFile is closed; cannot add it to an archive")
+            # Borrow the char* under the GIL; coercing a Python object is not
+            # allowed once it is released.
+            src_ptr = <const char*>src_bytes
+            with nogil:
+                idx = _batch_writer_add_mzml(
+                    self._writer, name_ptr, src_ptr, mapping, filesize, args)
+        else:
+            src = os.fspath(source)
+            src_bytes = src.encode("utf-8") if isinstance(src, str) else src
+            if not os.path.exists(src_bytes):
+                raise FileNotFoundError(f"File not found: {os.fsdecode(src_bytes)}")
+            fd = _open_input_file(src_bytes)
+            if fd < 0:
+                raise OSError(f"Could not open: {os.fsdecode(src_bytes)}")
+            filesize = _get_filesize(src_bytes)
+            mapping = _get_mapping(fd)
+            if mapping == NULL:
+                _close_file(fd)
+                raise OSError(f"Could not map: {os.fsdecode(src_bytes)}")
+            src_ptr = <const char*>src_bytes
+            try:
+                with nogil:
+                    idx = _batch_writer_add_mzml(
+                        self._writer, name_ptr, src_ptr, mapping, filesize, args)
+            finally:
+                _remove_mapping(mapping, filesize)
+                _close_file(fd)
+
+        if idx < 0:
+            raise ValueError(
+                f"Could not add {os.fsdecode(src_bytes)!r} to the archive "
+                f"(not an mzML file, or compression failed)"
+            )
+
+        self._entries.append(os.fsdecode(src_bytes))
+        return idx
+
+    def add_annotation(self, int entry_index, data, filename,
+                       format="tsv", compressed=False, num_records=None) -> None:
+        """
+        Attach an annotation file to a spectra entry, as its own archive member.
+
+        Parameters:
+        entry_index (int): Value returned by `add()`.
+        data (bytes): Annotation payload. Compression is the caller's job —
+            pass already-compressed bytes and set `compressed=True`.
+        filename (str): Member name inside the archive.
+        format (str): Reader-supported format tag (e.g. "percolator_tsv",
+            "pepxml", "tsv").
+        compressed (bool): Records whether `data` is zstd-compressed.
+        num_records (Optional[int]): Record/PSM count, if known.
+        """
+        self._check_open()
+
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise TypeError("Annotation data must be bytes-like")
+        cdef bytes payload = bytes(data)
+        cdef bytes fname = filename.encode("utf-8") if isinstance(filename, str) else filename
+        cdef bytes fmt = format.encode("utf-8") if isinstance(format, str) else format
+        cdef int64_t records = -1 if num_records is None else <int64_t>num_records
+
+        cdef const char* payload_ptr = <const char*>payload if len(payload) else NULL
+        if _batch_writer_add_annotation(
+                self._writer, entry_index, <const char*>fname,
+                <const void*>payload_ptr, <size_t>len(payload),
+                <const char*>fmt, 1 if compressed else 0, records) != 0:
+            raise ValueError(
+                f"Could not add annotation {os.fsdecode(fname)!r} to entry {entry_index}"
+            )
+
+    def add_psms(self, int entry_index, source, name=None, compressed=True) -> str:
+        """
+        Attach search results to a spectra entry, stored as mzTab.
+
+        Parameters:
+        entry_index (int): Value returned by `add()`.
+        source: A `PSMTable`, or a pepXML / Percolator / mzTab file to read.
+        name (Optional[str]): Member name; `.mztab` (and `.zst`) is appended.
+            Defaults to the source file name.
+        compressed (bool): zstd-compress the member (default True).
+
+        Returns:
+        str: The archive member name written.
+        """
+        self._check_open()
+        if not 0 <= entry_index < len(self._entries):
+            raise ValueError(f"Unknown entry index {entry_index}")
+
+        table = source if isinstance(source, PSMTable) else read_psms(source)
+        location = Path(self._entries[entry_index]).name
+        data = MzTab().write(table, ms_run_location=location).encode("utf-8")
+        if compressed:
+            data = compress(data)
+
+        member = MzTab.member_name(name or table.metadata.source_file or "psms", compressed)
+        self.add_annotation(entry_index, data, member, format="mztab",
+                            compressed=compressed, num_records=len(table))
+        return member
+
+    def set_join_key(self, int entry_index, join_key) -> None:
+        """Set the column used to join annotations to spectra for one entry."""
+        self._check_open()
+        cdef bytes key = join_key.encode("utf-8") if isinstance(join_key, str) else join_key
+        if _batch_writer_set_join_key(self._writer, entry_index, <const char*>key) != 0:
+            raise ValueError(f"Could not set join_key on entry {entry_index}")
+
+    def set_description(self, description) -> None:
+        """Set an archive-level free-text description."""
+        self._check_open()
+        cdef bytes desc = description.encode("utf-8") if isinstance(description, str) else description
+        if _batch_writer_set_description(self._writer, <const char*>desc) != 0:
+            raise ValueError("Could not set archive description")
+
+    def set_extra(self, extra) -> None:
+        """
+        Set the archive-level `extra` metadata object.
+
+        Parameters:
+        extra (dict): Serialized to JSON and embedded in the manifest.
+        """
+        self._check_open()
+        import json
+        cdef bytes blob = json.dumps(extra).encode("utf-8")
+        if _batch_writer_set_extra_json(self._writer, <const char*>blob) != 0:
+            raise ValueError("Could not set archive extra metadata")
+
+    def finish(self) -> None:
+        """
+        Write manifest.json and the end-of-archive marker, then close.
+
+        On failure the partial archive is removed. The writer is unusable
+        afterwards either way.
+        """
+        self._check_open()
+        cdef int rc = _batch_writer_finish(self._writer)
+        self._writer = NULL  # freed by finish(), success or not
+        self._finished = True
+        if rc != 0:
+            raise OSError(f"Could not finalize .mszx archive: {self._path}")
+
+    def abort(self) -> None:
+        """Discard the archive, removing the partial file. Idempotent."""
+        if self._writer != NULL:
+            _batch_writer_abort(self._writer)
+            self._writer = NULL
+
+    @property
+    def path(self):
+        """Output archive path."""
+        return self._path
+
+    @property
+    def entries(self) -> list:
+        """Source paths added so far, in archive order."""
+        return list(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is not None:
+            self.abort()
+        elif self._writer != NULL:
+            self.finish()
+        return False

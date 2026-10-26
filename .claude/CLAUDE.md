@@ -45,23 +45,23 @@ Test data lives in `test/data/` at the repo root and is shared by C, Python, and
 
 ### Node.js/TypeScript bindings
 ```bash
-# Build native addon + TypeScript (from node-ts/ dir)
-cd node-ts && npm run build
+# Build native addon + TypeScript (from node/ dir)
+cd node && npm run build
 
 # Build native addon only (prebuild + cmake-js)
-cd node-ts && npm run build:native
+cd node && npm run build:native
 
 # Build TypeScript only (tsc + tsc-alias)
-cd node-ts && npm run build:ts
+cd node && npm run build:ts
 
 # Debug native build
-cd node-ts && npm run build:debug
+cd node && npm run build:debug
 
 # Run all Node.js tests (59 tests, vitest)
-cd node-ts && npm test
+cd node && npm test
 
 # Run tests in watch mode
-cd node-ts && npm run test:watch
+cd node && npm run test:watch
 ```
 
 Test data lives in the repo-root `test/data/` directory, referenced via relative path (`../../test/data`) from the test fixtures.
@@ -120,7 +120,7 @@ A 512-byte header and a variable-length footer enable random access by storing b
 
 The Python build (`setup.py`) compiles all C sources + vendor libraries into a single Cython extension with architecture-specific SIMD flags for the base64 library.
 
-### Node.js/TypeScript bindings (`node-ts/`)
+### Node.js/TypeScript bindings (`node/`)
 - `src/native/*.cpp` — Node-API (NAPI v8) C++ addon wrapping the C core
 - `src/core/bindings.ts` — TypeScript interface to the native `.node` addon
 - `src/core/read.ts` — `read()` factory that auto-detects file type
@@ -151,25 +151,33 @@ These are critical for avoiding leaks and use-after-free:
 
 The project version lives in `version.txt` at the repo root — this is the single source of truth. It is maintained automatically by **release-please** (do NOT bump it by hand). All other files read from or are synced to it:
 
-- **CMake** — each `CMakeLists.txt` reads `version.txt` via `file(STRINGS ...)` to set `PROJECT_VERSION` (root, `cli/`, `node-ts/`, `node/`, `modules/python/`)
+- **CMake** — each `CMakeLists.txt` reads `version.txt` via `file(STRINGS ...)` to set `PROJECT_VERSION` (root, `cli/`, `node/`, `node/`, `modules/python/`)
 - **C code** — `cli/CMakeLists.txt` passes `VERSION` via `target_compile_definitions`
 - **Python** — `python/pyproject.toml` (`$.project.version`) and `python/mscompress/__init__.py` (`__version__`, carries an `# x-release-please-version` annotation) are updated by release-please via `release-please-config.json` `extra-files`
 - **npm** — all `package.json` files are updated by release-please `extra-files`
 
-Releases are automated. On push to `main`, `.github/workflows/release-please.yml` opens/updates a **release PR** (bumping `version.txt`, the package files, and `CHANGELOG.md`). Merging it creates the `vX.Y.Z` tag + GitHub Release and chains the build/publish pipeline (`build.yml` called via `workflow_call` with `publish: true`). Bump sizing: `feat:` → minor; `fix:`/`perf:`/`refactor:` → patch; `feat!:`/`BREAKING CHANGE` → major (the patch-triggering set is configured in `release-please-config.json` `changelog-sections`).
+Releases are automated in two phases following the `dev` → `stage` → `main` promotion flow:
+1. On push to `dev`, `.github/workflows/release-please.yml` opens/updates a **release PR targeting `dev`** (bumping `version.txt`, the package files, and `CHANGELOG.md`). Merging it into `dev` does **not** tag anything; the PR is left labeled `autorelease: pending`.
+2. The release commit is promoted `dev` → `stage` → `main` as usual. On push to `main`, release-please finds the pending release PR, creates the `vX.Y.Z` tag + GitHub Release (relabeling the PR `autorelease: tagged`), and dispatches the build/publish pipeline (`build.yml` started via `workflow_dispatch` with `publish=true`).
+
+Merge methods are enforced by repository rulesets: PRs into `dev` are **squash-only** (the commit message is the PR title, body blank), and PRs into `stage`/`main` are **merge-commit-only**. Because the PR title becomes the commit release-please parses, `.github/workflows/pr-title.yml` requires PR titles into `dev` to be Conventional Commits (allowed types mirror `changelog-sections`; use `feat!:` for breaking changes).
+
+Only one release can be in flight: while a merged release PR is still pending (not yet on `main`), release-please will not open a new release PR on `dev`. The tag points at the release commit on `dev`, which is in `main`'s history as long as promotions use merge commits (not squash). Hotfixes made directly on `stage`/`main` must be merged back into `dev` to be picked up. Bump sizing: `feat:` → minor; `fix:`/`perf:`/`refactor:` → patch; `feat!:`/`BREAKING CHANGE` → major (the patch-triggering set is configured in `release-please-config.json` `changelog-sections`).
 
 Never hardcode a version string in `src/mscompress.h` or any CMakeLists.txt — it comes from `version.txt`.
 
 ## CI/CD
 
-`.github/workflows/release-please.yml` (push to `main`) maintains the release PR and, when a release is cut, calls `build.yml` as a reusable workflow with `publish: true` + `release_tag`.
+`.github/workflows/release-please.yml` maintains the release PR on push to `dev`, and on push to `main` tags any promoted release PR and starts `build.yml` as a separate run (`gh workflow run build.yml -f publish=true -f release_tag=<tag>`; `GITHUB_TOKEN` is allowed to trigger `workflow_dispatch`).
 
-`.github/workflows/build.yml` runs on push to `stage`/`dev`, PRs to `dev`, and via `workflow_call` from release-please:
+release-please itself authenticates as a GitHub App (`actions/create-github-app-token`; repo variable `RELEASE_APP_CLIENT_ID`, secret `RELEASE_APP_PRIVATE_KEY`; the App needs Contents, Pull requests and Workflows read/write). `GITHUB_TOKEN` is not enough: the tag goes on the release commit on `dev`, and if a workflow change reached `main` after that commit, GitHub requires the Workflows permission to create a release there. `GITHUB_TOKEN` can never have it, so the call fails with 403 "Resource not accessible by integration".
+
+`.github/workflows/build.yml` runs on push to `stage`/`dev`, PRs to `dev`, and via `workflow_dispatch` (from release-please, or manually to re-publish a tag with `publish=true` + `release_tag`):
 1. **build-cli** — CMake build + ctest on Linux/Windows/macOS (x86_64, arm64)
-2. **build-python** — cibuildwheel for CPython 3.10–3.14 + pytest
+2. **build-python** — cibuildwheel for CPython 3.11–3.14 + pytest
 3. **build-node** — prebuild + cmake-js compile + vitest on Linux/macOS/Windows (x64, arm64)
 4. **publish-python** — PyPI publish (gated on `inputs.publish`)
 5. **publish-node** — npm publish (gated on `inputs.publish`; uploads prebuilds to GitHub Release)
 6. **build-docker** — Multi-arch Docker image (pushes on `inputs.publish`)
 
-> Operational note: PyPI trusted publishing matches the OIDC `job_workflow_ref` claim — the workflow file that *defines the publish job* — not the entry/caller workflow. The `publish-python` job stays in `build.yml`, so `job_workflow_ref` remains `build.yml` even when called from `release-please.yml`. The existing PyPI trusted-publisher config (workflow `build.yml`, environment `pypi`) therefore needs no change. It would only need updating if the publish step itself were moved into `release-please.yml`.
+> Operational note: `build.yml` must be the **top-level** workflow of the publish run — do not call it via `workflow_call`. PyPI trusted publishing matches the OIDC `job_workflow_ref` claim at login but verifies the upload's attestation against the Build Config URI (the top-level workflow), so a reusable-workflow call fails with "Build Config URI ... does not match expected Trusted Publisher". npm trusted publishing matches the top-level workflow too and fails with a bare `ENEEDAUTH` on mismatch. With `build.yml` dispatched on its own, the PyPI (workflow `build.yml`, environment `pypi`) and npm (workflow `build.yml`, environment `npm`) trusted-publisher configs both match.

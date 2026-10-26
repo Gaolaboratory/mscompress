@@ -29,8 +29,10 @@
  * @param out_len In: capacity of `dest` in bytes. Out: length of the base64
  *                output. If the output would not fit, nothing is written and
  *                `*out_len` is set to the required size (> the capacity passed).
- * @warning This function frees the `zlib_block_t*` `zblk` parameter internally.
- *          The caller must not free `zblk` after calling this function.
+ * @warning This function frees the `zlib_block_t*` `zblk` struct internally
+ *          (NOT `zblk->mem` — some callers wrap borrowed buffers). The caller
+ *          must not free `zblk` after calling this function, but the owner of
+ *          `zblk->mem` remains responsible for freeing that buffer.
  */
 void encode_base64(zlib_block_t* zblk, char* dest, size_t src_len,
                    size_t* out_len)
@@ -118,10 +120,11 @@ void encode_zlib_fun_no_header(z_stream* z, char** src, size_t src_len,
    // zlib_len = (size_t)zlib_compress(((Bytef*)*src) + ZLIB_SIZE_OFFSET,
    // cmp_output, src_len);
 
-   // encode_base64 frees the cmp_output struct but not its buffer
-   char* cmp_mem = cmp_output->mem;
+   /* encode_base64() frees the cmp_output struct but not its owned buffer
+    * (other callers pass borrowed buffers) — save and free it here. */
+   void* cmp_output_mem = cmp_output->mem;
    encode_base64(cmp_output, dest, zlib_len, out_len);
-   free(cmp_mem);
+   free(cmp_output_mem);
 
    *src += src_len;
 }
@@ -194,10 +197,11 @@ void encode_zlib_fun_w_header(z_stream* z, char** src, size_t src_len,
    free(decmp_input);
    free(decmp_header);
 
-   // encode_base64 frees the cmp_output struct but not its buffer
-   char* cmp_mem = cmp_output->mem;
+   /* encode_base64() frees the cmp_output struct but not its owned buffer
+    * (other callers pass borrowed buffers) — save and free it here. */
+   void* cmp_output_mem = cmp_output->mem;
    encode_base64(cmp_output, dest, zlib_len, out_len);
-   free(cmp_mem);
+   free(cmp_output_mem);
 
    *src += (ZLIB_SIZE_OFFSET + org_len);
 }
@@ -336,6 +340,34 @@ void no_encode_w_header(z_stream* z, char** src, size_t src_len, char* dest,
 
    free(decmp_input);
    *src += org_len + ZLIB_SIZE_OFFSET;
+}
+
+/**
+ * @brief Copies raw binary data verbatim into the destination buffer, without a
+ *        length header. Used by the Python no-encode read path for *lossy*
+ *        streams.
+ *
+ * Unlike `no_encode_w_header`, the source here is a standalone buffer produced
+ * by a lossy decode algo (e.g. `algo_encode_delta32_transform_64d`): freshly
+ * reconstructed samples with no `{ZLIB_TYPE len}{payload}` prefix. We therefore
+ * copy `src_len` bytes straight through and do NOT advance `*src` — the algo
+ * owns and advances its own cache cursor separately.
+ *
+ * @param z Unused; present for `encode_fun` signature compatibility.
+ * @param src Pointer to the source buffer pointer (the reconstructed samples).
+ * @param src_len Number of bytes to copy.
+ * @param dest Pre-allocated destination buffer.
+ * @param out_len In: capacity of `dest` in bytes. Out: number of bytes copied
+ *                (`src_len`). If the data would not fit, nothing is copied and
+ *                `*out_len` is set to the required size (> the capacity passed).
+ */
+void no_encode_no_header(z_stream* z, char** src, size_t src_len, char* dest,
+                         size_t* out_len)
+{
+   (void)z;
+   if (src_len <= *out_len)
+      memcpy(dest, *src, src_len);
+   *out_len = src_len;
 }
 
 /**

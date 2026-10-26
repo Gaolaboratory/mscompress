@@ -28,6 +28,98 @@
 #else
 #include <sys/mman.h>
 #include <unistd.h>
+
+
+/* MSFragger 4.4.1+ only accepts an mzML whose </indexedmzML> sits on its own
+ * line: a newline immediately before the tag and one ending the file. mzML
+ * written by older raw2ms builds (and some other converters) glues the tag
+ * to the checksum element and to EOF. After decompressing, repair the tail
+ * on disk and tell the user what was changed. Best effort: on any anomaly
+ * the file is left exactly as decompressed. */
+void fix_mzml_closing_tag(const char* path) {
+   static const char tag[] = "</indexedmzML>";
+   const size_t taglen = sizeof(tag) - 1;
+
+   if (!path) return;
+   FILE* f = fopen(path, "r+b");
+   if (!f) return;
+
+   long size;
+   if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < (long)taglen) {
+      fclose(f);
+      return;
+   }
+
+   char tail[64];
+   long start = size - (long)sizeof(tail);
+   if (start < 0) start = 0;
+   if (fseek(f, start, SEEK_SET) != 0) {
+      fclose(f);
+      return;
+   }
+   size_t got = fread(tail, 1, (size_t)(size - start), f);
+
+   /* the last occurrence in the tail is the document's closing tag */
+   char* hit = NULL;
+   for (char* p = tail + got - taglen; p >= tail; p--)
+      if (memcmp(p, tag, taglen) == 0) {
+         hit = p;
+         break;
+      }
+   if (!hit) { /* flat mzML (no indexed wrapper) or tag not at the end */
+      fclose(f);
+      return;
+   }
+   long tag_pos = start + (long)(hit - tail);
+
+   char prev = '\n';
+   if (hit > tail)
+      prev = hit[-1];
+   else if (start > 0) {
+      if (fseek(f, start - 1, SEEK_SET) != 0 || fread(&prev, 1, 1, f) != 1) {
+         fclose(f);
+         return;
+      }
+   }
+   long end_after = tag_pos + (long)taglen;
+   int need_before = start == 0 && tag_pos == 0 ? 0 : (prev != '\n');
+   int need_after = !(size == end_after + 1); /* must end tag + one '\n' */
+   if (!need_before && !need_after) {
+      fclose(f);
+      return;
+   }
+
+   if (fseek(f, tag_pos, SEEK_SET) != 0) {
+      fclose(f);
+      return;
+   }
+   if (need_before && fputc('\n', f) == EOF) {
+      fclose(f);
+      return;
+   }
+   if (fwrite(tag, 1, taglen, f) != taglen || fputc('\n', f) == EOF) {
+      fclose(f);
+      return;
+   }
+   long new_size = tag_pos + (need_before ? 1 : 0) + (long)taglen + 1;
+   fflush(f);
+#ifdef _WIN32
+   _chsize(_fileno(f), new_size);
+#else
+   ftruncate(fileno(f), new_size);
+#endif
+   fclose(f);
+
+   /* print() is gated on --verbose; this notice is for whoever decompressed
+    * the file, so it goes to stderr unconditionally (stdout may be
+    * redirected). */
+   fprintf(stderr,
+           "\tNote: the original mzML was not MSFragger 4.4.1+ compatible\n"
+           "\t(</indexedmzML> was not on its own line); added the missing\n"
+           "\tnewline%s so the tag ends the file on its own line.\n",
+           need_before && need_after ? "s" : "");
+}
+
 #define PATH_SEP '/'
 #endif
 
@@ -235,6 +327,95 @@ static char* derive_mzml_path(const char* input_path, const char* output_dir) {
  *
  * @return 0 on success, non-zero on failure.
  */
+/* Read a tar entry's raw bytes into a NUL-terminated heap buffer. */
+static char* read_entry_bytes(int fd, int64_t offset, size_t size) {
+   char* buf = malloc(size + 1);
+   if (!buf) return NULL;
+#ifdef _WIN32
+   if (_lseeki64(fd, offset, SEEK_SET) < 0) { free(buf); return NULL; }
+#else
+   if (lseek(fd, (off_t)offset, SEEK_SET) < 0) { free(buf); return NULL; }
+#endif
+   size_t got = 0;
+   while (got < size) {
+      ssize_t n = read(fd, buf + got, (unsigned int)(size - got));
+      if (n <= 0) { free(buf); return NULL; }
+      got += (size_t)n;
+   }
+   buf[size] = '\0';
+   return buf;
+}
+
+char* mszx_read_entry(int fd, const mszx_entry_t* entry) {
+   if (fd < 0 || !entry) return NULL;
+   return read_entry_bytes(fd, entry->offset, entry->size);
+}
+
+/* Parse the manifest "version" field's major integer, or -1 if absent. */
+static int manifest_version_major(const char* buf) {
+   const char* v = strstr(buf, "\"version\"");
+   if (!v) return -1;
+   v += strlen("\"version\"");
+   while (*v && *v != ':') v++;
+   if (*v == ':') v++;
+   while (*v == ' ' || *v == '\t') v++;
+   if (*v != '"') return -1;
+   v++;
+   int major = 0, seen = 0;
+   while (*v >= '0' && *v <= '9') { major = major * 10 + (*v - '0'); v++; seen = 1; }
+   return seen ? major : -1;
+}
+
+/* Highest manifest schema major version this build understands. */
+#define MSZX_MANIFEST_MAX_MAJOR 2
+
+static int manifest_is_batch(const char* buf) {
+   const char* c = strstr(buf, "\"container\"");
+   if (!c) return 0;
+   const char* q = strchr(c, ':');
+   return q && strstr(q, "batch") != NULL;
+}
+
+/* Decompress one embedded .msz entry to out_path via offset-mmap into the tar. */
+static int decompress_msz_entry(int fd, mszx_entry_t* msz, const char* out_path,
+                                Arguments* arguments) {
+   size_t pad = 0, map_length = 0;
+   void* base = get_mapping_range(fd, msz->offset, msz->size, &pad, &map_length);
+   if (!base) {
+      warning("decompress_mszx: failed to mmap entry '%s'\n", msz->name);
+      return -1;
+   }
+   int out_fd = open_output_file((char*)out_path);
+   if (out_fd < 0) {
+      warning("decompress_mszx: could not open output '%s'\n", out_path);
+      remove_mapping(base, map_length);
+      return -1;
+   }
+   print("\tDecompressing %s -> %s\n", msz->name, out_path);
+   int rc = decompress_msz((char*)base + pad, msz->size, arguments, out_fd);
+   close_file(out_fd);
+   remove_mapping(base, map_length);
+   return rc;
+}
+
+/* Build "<output_dir>/<basename(entry) minus .msz>.mzML". */
+static char* derive_entry_mzml_path(const char* entry_name,
+                                    const char* output_dir) {
+   const char* base = path_basename(entry_name);
+   size_t bl = strlen(base);
+   if (bl > 4 && strcmp(base + bl - 4, ".msz") == 0) bl -= 4;
+   const char* ext = ".mzML";
+   size_t el = strlen(ext);
+   char* fname = malloc(bl + el + 1);
+   if (!fname) return NULL;
+   memcpy(fname, base, bl);
+   memcpy(fname + bl, ext, el);
+   fname[bl + el] = '\0';
+   char* full = join_path(output_dir, fname);
+   free(fname);
+   return full;
+}
+
 int decompress_mszx(char* input_path, char* output_dir, Arguments* arguments) {
    if (!input_path || !output_dir || !arguments) return -1;
 
@@ -259,68 +440,95 @@ int decompress_mszx(char* input_path, char* output_dir, Arguments* arguments) {
       return -1;
    }
 
-   /* Locate the spectra entry (first .msz). */
-   ssize_t spectra_idx = -1;
+   /* Read manifest (if any) to (a) reject archives from a newer mscompress and
+    * (b) decide single-file (legacy) vs multi-file (batch) layout. */
+   int is_batch = 0;
    for (size_t i = 0; i < n_entries; ++i) {
-      if (ends_with(entries[i].name, ".msz")) {
-         spectra_idx = (ssize_t)i;
+      if (strcmp(entries[i].name, "manifest.json") == 0) {
+         char* mbuf = read_entry_bytes(fd, entries[i].offset, entries[i].size);
+         if (mbuf) {
+            int major = manifest_version_major(mbuf);
+            if (major > MSZX_MANIFEST_MAX_MAJOR) {
+               error("decompress_mszx: '%s' was written by a newer mscompress "
+                     "(manifest version %d > %d); please upgrade.\n",
+                     input_path, major, MSZX_MANIFEST_MAX_MAJOR);
+               free(mbuf);
+               mszx_free_entries(entries, n_entries);
+               close_file(fd);
+               return -1;
+            }
+            is_batch = manifest_is_batch(mbuf);
+            free(mbuf);
+         }
          break;
       }
    }
-   if (spectra_idx < 0) {
+
+   /* Count .msz entries; >1 also implies a batch archive. */
+   size_t msz_count = 0;
+   ssize_t first_msz = -1;
+   for (size_t i = 0; i < n_entries; ++i) {
+      if (ends_with(entries[i].name, ".msz")) {
+         if (first_msz < 0) first_msz = (ssize_t)i;
+         msz_count++;
+      }
+   }
+   if (msz_count == 0) {
       warning("decompress_mszx: no .msz entry found in '%s'\n", input_path);
       mszx_free_entries(entries, n_entries);
       close_file(fd);
       return -1;
    }
+   if (msz_count > 1) is_batch = 1;
 
-   /* Decompress the MSZ via offset-mmap into the tar. */
-   mszx_entry_t* msz = &entries[spectra_idx];
-   size_t pad = 0, map_length = 0;
-   void* base = get_mapping_range(fd, msz->offset, msz->size, &pad, &map_length);
-   if (!base) {
-      warning("decompress_mszx: failed to mmap MSZ entry from '%s'\n",
-              input_path);
-      mszx_free_entries(entries, n_entries);
-      close_file(fd);
-      return -1;
-   }
+   int rc = 0;
 
-   char* mzml_path = derive_mzml_path(input_path, output_dir);
-   if (!mzml_path) {
-      remove_mapping(base, map_length);
-      mszx_free_entries(entries, n_entries);
-      close_file(fd);
-      return -1;
-   }
-
-   int out_fd = open_output_file(mzml_path);
-   if (out_fd < 0) {
-      warning("decompress_mszx: could not open output mzML '%s'\n", mzml_path);
+   if (!is_batch) {
+      /* Legacy single-file layout: name output after the archive. */
+      mszx_entry_t* msz = &entries[first_msz];
+      char* mzml_path = derive_mzml_path(input_path, output_dir);
+      if (!mzml_path) {
+         mszx_free_entries(entries, n_entries);
+         close_file(fd);
+         return -1;
+      }
+      rc = decompress_msz_entry(fd, msz, mzml_path, arguments);
+      if (rc == 0) fix_mzml_closing_tag(mzml_path);
       free(mzml_path);
-      remove_mapping(base, map_length);
-      mszx_free_entries(entries, n_entries);
-      close_file(fd);
-      return -1;
+      if (rc != 0) {
+         warning("decompress_mszx: decompress_msz failed\n");
+         mszx_free_entries(entries, n_entries);
+         close_file(fd);
+         return -1;
+      }
+   } else {
+      /* Batch layout: expand every .msz entry, naming each from its entry. */
+      for (size_t i = 0; i < n_entries; ++i) {
+         if (!ends_with(entries[i].name, ".msz")) continue;
+         char* out_path = derive_entry_mzml_path(entries[i].name, output_dir);
+         if (!out_path) { rc = -1; break; }
+         rc = decompress_msz_entry(fd, &entries[i], out_path, arguments);
+         if (rc == 0) fix_mzml_closing_tag(out_path);
+         free(out_path);
+         if (rc != 0) {
+            warning("decompress_mszx: failed to expand entry '%s'\n",
+                    entries[i].name);
+            break;
+         }
+      }
+      if (rc != 0) {
+         mszx_free_entries(entries, n_entries);
+         close_file(fd);
+         return -1;
+      }
    }
 
-   print("\tDecompressing MSZ entry to %s\n", mzml_path);
-   int rc = decompress_msz((char*)base + pad, msz->size, arguments, out_fd);
-   close_file(out_fd);
-   free(mzml_path);
-   remove_mapping(base, map_length);
-
-   if (rc != 0) {
-      warning("decompress_mszx: decompress_msz failed\n");
-      mszx_free_entries(entries, n_entries);
-      close_file(fd);
-      return -1;
-   }
-
-   /* Extract annotation entries. Skip the spectra entry and manifest.json. */
+   /* Extract annotation entries. Skip ALL .msz entries, manifest.json and the
+    * spectrum index (archive-internal; it describes the .msz members). */
    for (size_t i = 0; i < n_entries; ++i) {
-      if ((ssize_t)i == spectra_idx) continue;
+      if (ends_with(entries[i].name, ".msz")) continue;
       if (strcmp(entries[i].name, "manifest.json") == 0) continue;
+      if (strcmp(entries[i].name, MSZX_INDEX_ENTRY) == 0) continue;
 
       const char* entry_name = entries[i].name;
       int is_zst = ends_with(entry_name, ".zst");
@@ -358,6 +566,196 @@ int decompress_mszx(char* input_path, char* output_dir, Arguments* arguments) {
       free(out_path);
    }
 
+   mszx_free_entries(entries, n_entries);
+   close_file(fd);
+   return rc;
+}
+
+/**
+ * @brief Print a table of contents for a .mszx archive without decompressing.
+ *
+ * Walks the USTAR entries and prints each entry name + size, flags the .msz
+ * spectra entries, and reports the manifest version/container if present.
+ *
+ * @return 0 on success, non-zero on failure.
+ */
+int list_mszx(char* input_path) {
+   if (!input_path) return -1;
+
+   int fd = open_input_file(input_path);
+   if (fd < 0) {
+      warning("list_mszx: could not open '%s'\n", input_path);
+      return -1;
+   }
+
+   mszx_entry_t* entries = NULL;
+   size_t n_entries = 0;
+   if (mszx_list_entries(fd, &entries, &n_entries) != 0) {
+      warning("list_mszx: '%s' is not a valid USTAR archive\n", input_path);
+      close_file(fd);
+      return -1;
+   }
+
+   int major = -1, batch = 0;
+   for (size_t i = 0; i < n_entries; ++i) {
+      if (strcmp(entries[i].name, "manifest.json") == 0) {
+         char* mbuf = read_entry_bytes(fd, entries[i].offset, entries[i].size);
+         if (mbuf) {
+            major = manifest_version_major(mbuf);
+            batch = manifest_is_batch(mbuf);
+            free(mbuf);
+         }
+         break;
+      }
+   }
+
+   size_t msz_count = 0;
+   for (size_t i = 0; i < n_entries; ++i)
+      if (ends_with(entries[i].name, ".msz")) msz_count++;
+
+   printf("Archive: %s\n", input_path);
+   if (major < 0)
+      printf("  manifest: (none)\n");
+   else
+      printf("  manifest: major version %d, container %s\n", major,
+             batch ? "batch" : "single");
+   printf("  entries: %zu (%zu .msz spectra file(s))\n", n_entries, msz_count);
+   printf("  %-40s %14s  %s\n", "NAME", "SIZE", "KIND");
+   for (size_t i = 0; i < n_entries; ++i) {
+      const char* kind = "annotation";
+      if (ends_with(entries[i].name, ".msz"))
+         kind = "spectra";
+      else if (strcmp(entries[i].name, "manifest.json") == 0)
+         kind = "manifest";
+      else if (strcmp(entries[i].name, MSZX_INDEX_ENTRY) == 0)
+         kind = "index";
+      printf("  %-40s %14zu  %s\n", entries[i].name, entries[i].size, kind);
+   }
+
+   mszx_free_entries(entries, n_entries);
+   close_file(fd);
+   return 0;
+}
+
+/* Print one value of a query result; missing values print as "NA". */
+static void print_index_cell(const mszx_index_t* idx, int column, uint32_t row) {
+   double v = mszx_index_value(idx, column, row);
+   switch (column) {
+      case MSZX_COL_RT_SEC:
+      case MSZX_COL_TIC:
+         if (v != v) printf("NA"); else printf("%.7g", v);
+         break;
+      case MSZX_COL_PRECURSOR_MZ:
+      case MSZX_COL_BASE_PEAK_MZ: /* f32: 9 digits round-trip */
+         if (v != v) printf("NA"); else printf("%.9g", v);
+         break;
+      case MSZX_COL_CHARGE:
+      case MSZX_COL_MS_LEVEL:
+         if (v == 0 || v != v) printf("NA"); else printf("%.0f", v);
+         break;
+      default:
+         printf("%.0f", v);
+   }
+}
+
+/**
+ * @brief Print the spectra of a batch .mszx matching `query` as TSV.
+ *
+ * Reads the index member through an mmap — no .msz member is opened. Fails
+ * on an archive written without an index.
+ *
+ * @return 0 on success, non-zero on failure.
+ */
+int query_mszx(char* input_path, const char* query) {
+   if (!input_path || !query) return -1;
+
+   mszx_index_term_t* terms = NULL;
+   size_t n_terms = 0;
+   if (mszx_index_parse_query(query, &terms, &n_terms) != 0) return -1;
+
+   int fd = open_input_file(input_path);
+   if (fd < 0) {
+      warning("query_mszx: could not open '%s'\n", input_path);
+      free(terms);
+      return -1;
+   }
+
+   mszx_entry_t* entries = NULL;
+   size_t n_entries = 0;
+   if (mszx_list_entries(fd, &entries, &n_entries) != 0) {
+      warning("query_mszx: '%s' is not a valid USTAR archive\n", input_path);
+      free(terms);
+      close_file(fd);
+      return -1;
+   }
+
+   /* Entry ids are positions among the .msz members, in archive order (which
+    * is manifest order for every writer). */
+   const char** names = calloc(n_entries ? n_entries : 1, sizeof(char*));
+   size_t n_msz = 0;
+   mszx_entry_t* index_entry = NULL;
+   for (size_t i = 0; names && i < n_entries; ++i) {
+      if (ends_with(entries[i].name, ".msz")) names[n_msz++] = entries[i].name;
+      if (strcmp(entries[i].name, MSZX_INDEX_ENTRY) == 0)
+         index_entry = &entries[i];
+   }
+
+   void* map_base = NULL;
+   size_t map_length = 0;
+   const void* data = NULL;
+   size_t data_len = 0;
+   int rc = names ? 0 : -1;
+
+   if (rc == 0 && index_entry) {
+      size_t pad = 0;
+      map_base = get_mapping_range(fd, index_entry->offset, index_entry->size,
+                                   &pad, &map_length);
+      if (!map_base) {
+         warning("query_mszx: cannot map %s\n", MSZX_INDEX_ENTRY);
+         rc = -1;
+      } else {
+         data = (char*)map_base + pad;
+         data_len = index_entry->size;
+      }
+   } else if (rc == 0) {
+      error("query_mszx: '%s' has no spectrum index (it was written with "
+            "--no-index or by an older mscompress)\n",
+            input_path);
+      rc = -1;
+   }
+
+   mszx_index_t* idx = rc == 0 ? mszx_index_open(data, data_len) : NULL;
+   uint32_t* rows = NULL;
+   size_t n_rows = 0;
+   if (rc == 0 && (!idx || mszx_index_query(idx, terms, n_terms, &rows,
+                                            &n_rows) != 0))
+      rc = -1;
+
+   if (rc == 0) {
+      const char** cols;
+      size_t n_cols = mszx_index_columns(&cols);
+      printf("entry_name");
+      for (size_t c = 0; c < n_cols; ++c) printf("\t%s", cols[c]);
+      printf("\n");
+      for (size_t r = 0; r < n_rows; ++r) {
+         uint32_t row = rows[r];
+         double e = mszx_index_value(idx, MSZX_COL_ENTRY, row);
+         size_t ei = (size_t)e;
+         printf("%s", ei < n_msz ? names[ei] : "?");
+         for (size_t c = 0; c < n_cols; ++c) {
+            printf("\t");
+            print_index_cell(idx, mszx_index_column_id(cols[c]), row);
+         }
+         printf("\n");
+      }
+      print("%zu matching spectra\n", n_rows);
+   }
+
+   free(rows);
+   mszx_index_close(idx);
+   if (map_base) remove_mapping(map_base, map_length);
+   free(names);
+   free(terms);
    mszx_free_entries(entries, n_entries);
    close_file(fd);
    return rc;
