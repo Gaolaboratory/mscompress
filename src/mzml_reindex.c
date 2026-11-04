@@ -460,3 +460,75 @@ void mzml_reindex_free(mzml_reindex_t* rx) {
    free(rx->tail);
    free(rx);
 }
+
+/* === encodedLength repair for an assembled chunk ========================= */
+
+long mzml_fix_encoded_lengths(char** buf, size_t* len) {
+   static const char tag[] = "<binaryDataArray";
+   static const char attr[] = "encodedLength";
+   const size_t tl = sizeof(tag) - 1, al = sizeof(attr) - 1;
+   const char* s = *buf;
+   const char* end = s + *len;
+   const char* copied = s; /* source bytes before this are already in out */
+   char* out = NULL;
+   size_t ol = 0, oc = 0;
+   long n_fixed = 0;
+   char num[32];
+
+   const char* q = s;
+   while ((size_t)(end - q) > tl) {
+      const char* t = memchr(q, '<', (size_t)(end - q));
+      if (!t || (size_t)(end - t) <= tl) break;
+      if (memcmp(t, tag, tl) != 0 || !(rx_is_ws(t[tl]) || t[tl] == '>')) {
+         q = t + 1;
+         continue;
+      }
+      const char* gt = memchr(t, '>', (size_t)(end - t));
+      if (!gt) break;
+      q = gt + 1;
+
+      size_t vlen;
+      const char* v = rx_attr(t, gt, attr, &vlen);
+      if (!v) continue;
+
+      /* this array's <binary> text */
+      const char* b0 = NULL;
+      for (const char* r = gt; r + 8 <= end; r++) {
+         r = memchr(r, '<', (size_t)(end - r));
+         if (!r || r + 8 > end) break;
+         if (memcmp(r, "<binary>", 8) == 0) {
+            b0 = r + 8;
+            break;
+         }
+         if (end - r >= 17 && memcmp(r, "</binaryDataArray", 17) == 0)
+            break; /* array without <binary>: leave it */
+      }
+      if (!b0) continue;
+      const char* b1 = memchr(b0, '<', (size_t)(end - b0));
+      if (!b1) break;
+
+      int n = snprintf(num, sizeof(num), "%zu", (size_t)(b1 - b0));
+      if ((size_t)n == vlen && memcmp(v, num, vlen) == 0) {
+         q = b1;
+         continue;
+      }
+      if (rx_append(&out, &ol, &oc, copied, (size_t)(v - copied)) != 0 ||
+          rx_append(&out, &ol, &oc, num, (size_t)n) != 0) {
+         free(out);
+         return -1;
+      }
+      copied = v + vlen;
+      n_fixed++;
+      q = b1;
+   }
+
+   if (n_fixed == 0) return 0;
+   if (rx_append(&out, &ol, &oc, copied, (size_t)(end - copied)) != 0) {
+      free(out);
+      return -1;
+   }
+   free(*buf);
+   *buf = out;
+   *len = ol;
+   return n_fixed;
+}

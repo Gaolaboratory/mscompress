@@ -8,9 +8,11 @@
  * idxout_begin/mark/write/finish into a temp file, then read back and
  * verified against real bytes: index offsets must seek onto "<spectrum" in
  * the produced file, the offset count must equal the spectra emitted, and
- * <fileChecksum> must equal SHA-1 recomputed over <indexedmzML .. </indexList>
+ * <fileChecksum> must equal SHA-1 recomputed over output byte 0 through the
+ * end of the "<fileChecksum>" open tag, the span mzML1.1.x_idx.xsd defines
  * (that recomputation is also the safety net for the incremental
- * sha1_init/update/final path used by the writer).
+ * sha1_init/update/final path used by the writer). An already-indexed source
+ * keeps its wrapper but gets a fresh index in place of its stale one.
  */
 
 #include "../sha1.h"
@@ -96,20 +98,13 @@ static int get_file_checksum(const char* buf, char hex[41]) {
      idRefs match the expected (escaped) ids in order
    - seeking each offset in the file (fd) lands on "<spectrum", and the
      spectrum found there carries the matching id="..."
-   - <fileChecksum> equals SHA-1 over [first byte of <indexedmzML .. end of
-     </indexList>] */
-static void verify_wrapped_output(int fd, const char* buf, size_t len,
-                                  const char* const* exp_ids, size_t n_exp) {
+   - <fileChecksum> equals SHA-1 over [byte 0 .. end of "<fileChecksum>"] */
+static void verify_index(int fd, const char* buf, size_t len,
+                         const char* const* exp_ids, size_t n_exp) {
    CHECK(len > 40, "output is non-trivial");
    if (len <= 40)
       return;
 
-   CHECK(strncmp(buf, "<?xml ", 6) == 0, "output starts with <?xml");
-   const char* wrap_start = strstr(buf, "<indexedmzML");
-   CHECK(wrap_start != NULL, "output contains <indexedmzML");
-   CHECK(strncmp(buf, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n", 39) == 0,
-         "our XML declaration is first");
-   CHECK(wrap_start == buf + 39, "<indexedmzML follows the declaration");
    CHECK(strcmp(buf + len - strlen("</indexedmzML>\n"), "</indexedmzML>\n") == 0,
          "output ends with </indexedmzML>\\n");
 
@@ -157,19 +152,21 @@ static void verify_wrapped_output(int fd, const char* buf, size_t len,
    for (size_t i = 0; i < n; i++)
       free(ids[i]);
 
-   /* Checksum: PSI convention — SHA-1 from the first byte of <indexedmzML
-      through the last byte of </indexList>, recomputed here in one shot. */
+   /* Checksum: mzML1.1.x_idx.xsd — "SHA-1 checksum from beginning of file
+      to end of 'fileChecksum' open tag", recomputed here in one shot. */
    const char* il_end = strstr(buf, "</indexList>");
    CHECK(il_end != NULL, "found </indexList>");
-   if (!il_end)
+   const char* ck = strstr(buf, "<fileChecksum>");
+   CHECK(ck != NULL, "found <fileChecksum>");
+   if (!il_end || !ck)
       return;
-   size_t span = (size_t)(il_end + strlen("</indexList>") - wrap_start);
+   size_t span = (size_t)(ck + strlen("<fileChecksum>") - buf);
    char hex[41];
-   sha1_hex(wrap_start, span, hex);
+   sha1_hex(buf, span, hex);
    char emitted[41];
    CHECK(get_file_checksum(buf, emitted) == 0, "fileChecksum present");
    CHECK(strcmp(hex, emitted) == 0,
-         "fileChecksum equals SHA-1 over <indexedmzML .. </indexList>");
+         "fileChecksum equals SHA-1 over byte 0 .. <fileChecksum>");
 
    /* <indexListOffset> is required by the indexedmzML schema and must name
       the absolute position where our <indexList begins. */
@@ -183,6 +180,20 @@ static void verify_wrapped_output(int fd, const char* buf, size_t len,
             "indexListOffset equals position of <indexList");
       CHECK(ilo > il_end, "indexListOffset emitted after </indexList>");
    }
+}
+
+/* Raw-path output: our declaration and <indexedmzML wrapper, then the index
+   checks above. */
+static void verify_wrapped_output(int fd, const char* buf, size_t len,
+                                  const char* const* exp_ids, size_t n_exp) {
+   CHECK(len > 40, "output is non-trivial");
+   if (len <= 40)
+      return;
+   CHECK(strncmp(buf, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n", 39) == 0,
+         "our XML declaration is first");
+   CHECK(strncmp(buf + 39, "<indexedmzML", 12) == 0,
+         "<indexedmzML follows the declaration");
+   verify_index(fd, buf, len, exp_ids, n_exp);
 }
 
 /* --- driver ---------------------------------------------------------------- */
@@ -225,8 +236,8 @@ static char* run_idxout(const char* header, const char* const* spec_xml,
       CHECK(idxout_write(&io, s + lead, strlen(s + lead)) == 0,
             "idxout_write spectrum");
    }
-   CHECK(idxout_write(&io, footer, strlen(footer)) == 0,
-         "idxout_write footer");
+   CHECK(idxout_write_scan(&io, footer, strlen(footer)) == 0,
+         "idxout_write_scan footer");
    CHECK(idxout_finish(&io) == 0, "idxout_finish");
 
    struct stat st;
@@ -342,7 +353,7 @@ static void test_wrap_escaped_id_roundtrips(void) {
 
 /* Source document without a trailing newline before the indexList: the
    writer must put the index on its own line and the checksum must still
-   span exactly <indexedmzML .. </indexList>. */
+   cover byte 0 .. <fileChecksum>. */
 static void test_wrap_without_footer_newline(void) {
    const char* header =
       "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
@@ -437,113 +448,115 @@ static void test_wrap_leading_whitespace_chunk(void) {
    free(buf);
 }
 
-/* mzML-path msz: the stored document is already <indexedmzML>-wrapped, so
-   the writer must pass it through byte-identically and never double-wrap.
-   finish() only guarantees the trailing newline. */
-static void test_passthrough_already_indexed(void) {
-   const char* doc =
+/* mzML-path msz: the stored document is already <indexedmzML>-wrapped and
+   carries the source's index, which no longer matches the extracted subset.
+   The writer must keep the source header verbatim (no second wrapper or
+   declaration), drop the stale tail after </mzML>, and append a fresh
+   index and checksum. */
+static void test_indexed_source_gets_fresh_index(void) {
+   const char* header =
       "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
       "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">"
       "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\">"
-      "<spectrumList count=\"1\">"
-      "<spectrum index=\"0\" id=\"scan=1\"><binary>AQ==</binary></spectrum>"
+      "<spectrumList count=\"1\">";
+   const char* specs[] = {
+      "<spectrum index=\"0\" id=\"scan=2\"><binary>AQ==</binary></spectrum>",
+   };
+   const char* ids[] = {"scan=2"};
+   const char* footer =
       "</spectrumList></mzML>"
       "<indexList count=\"1\"><index name=\"spectrum\">"
       "<offset idRef=\"scan=1\">123</offset>"
-      "</index></indexList>"
+      "<offset idRef=\"scan=2\">456</offset>"
+      "</index></indexList><indexListOffset>789</indexListOffset>"
       "<fileChecksum>0123456789abcdef0123456789abcdef01234567</fileChecksum>"
       "</indexedmzML>"; /* no trailing newline */
 
-   char tmpl[] = "/tmp/idx_writer_pass_XXXXXX";
-   int fd = mkstemp(tmpl);
-   CHECK(fd >= 0, "mkstemp for passthrough");
-   if (fd < 0)
+   size_t len = 0;
+   int fd = -1;
+   char* buf = run_idxout(header, specs, ids, 1, footer, &len, &fd);
+   if (!buf)
       return;
 
-   idxout_t io;
-   CHECK(idxout_begin(&io, fd, doc, strlen(doc)) == 0,
-         "idxout_begin passthrough");
-   CHECK(io.wrap == 0, "already-indexed source selects passthrough");
-   CHECK(idxout_finish(&io) == 0, "idxout_finish passthrough");
-
-   struct stat st;
-   fstat(fd, &st);
-   CHECK((size_t)st.st_size == strlen(doc) + 1,
-         "passthrough output is input plus exactly one newline");
-   char* buf = malloc((size_t)st.st_size + 1);
-   CHECK(buf != NULL, "malloc passthrough readback");
-   if (!buf) {
-      close(fd);
-      unlink(tmpl);
-      return;
-   }
-   lseek(fd, 0, SEEK_SET);
-   ssize_t got = read(fd, buf, (size_t)st.st_size);
-   CHECK(got == st.st_size, "read back passthrough output");
-   buf[st.st_size] = '\0';
-
-   CHECK(memcmp(buf, doc, strlen(doc)) == 0,
-         "passthrough emits the source verbatim");
-   CHECK(buf[strlen(doc)] == '\n', "finish appends the missing newline");
-
-   /* No second wrapper: exactly one <indexedmzML and one <?xml in output. */
+   CHECK(memcmp(buf, header, strlen(header)) == 0,
+         "source header kept verbatim");
    const char* p = buf;
-   int wraps = 0, decls = 0;
+   int wraps = 0, decls = 0, lists = 0;
    while ((p = strstr(p, "<indexedmzML")) != NULL) {
       wraps++;
       p++;
    }
-   p = buf;
-   while ((p = strstr(p, "<?xml")) != NULL) {
+   for (p = buf; (p = strstr(p, "<?xml")) != NULL; p++)
       decls++;
-      p++;
-   }
-   CHECK(wraps == 1, "no double wrap in passthrough");
-   CHECK(decls == 1, "no injected declaration in passthrough");
-   CHECK(strstr(buf, "<indexListOffset") == NULL,
-         "no indexListOffset injected in passthrough");
-
-   free(buf);
+   for (p = buf; (p = strstr(p, "<indexList ")) != NULL; p++)
+      lists++;
+   CHECK(wraps == 1, "no double wrap");
+   CHECK(decls == 1, "no injected declaration");
+   CHECK(lists == 1, "stale indexList replaced, not duplicated");
+   CHECK(strstr(buf, "scan=1") == NULL, "stale entry for scan=1 dropped");
+   CHECK(strstr(buf, "0123456789abcdef0123456789abcdef01234567") == NULL,
+         "stale checksum dropped");
+   CHECK(strstr(buf, "</mzML>\n<indexList") != NULL,
+         "fresh indexList on its own line after </mzML>");
+   verify_index(fd, buf, len, ids, 1);
    close(fd);
-   unlink(tmpl);
+   free(buf);
 }
 
-/* Same, but the source already ends with '\n': nothing must be appended. */
-static void test_passthrough_trailing_newline_kept(void) {
-   const char* doc =
+/* Chromatograms in the footer get their own index; indexList count is 2. */
+static void test_chromatograms_indexed(void) {
+   const char* header =
       "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
-      "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">"
-      "<mzML><spectrumList count=\"0\"></spectrumList></mzML>"
-      "</indexedmzML>\n";
+      "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><run id=\"r\">"
+      "<spectrumList count=\"1\">";
+   const char* specs[] = {
+      "<spectrum index=\"0\" id=\"scan=1\"><binary>AQ==</binary></spectrum>\n",
+   };
+   const char* ids[] = {"scan=1"};
+   const char* footer =
+      "</spectrumList><chromatogramList count=\"2\">\n"
+      "<chromatogram index=\"0\" id=\"TIC\" defaultArrayLength=\"1\">"
+      "</chromatogram>\n"
+      "<chromatogram index=\"1\" id='BPC' defaultArrayLength=\"1\">"
+      "</chromatogram>\n"
+      "</chromatogramList></run></mzML>\n";
 
-   char tmpl[] = "/tmp/idx_writer_pass2_XXXXXX";
-   int fd = mkstemp(tmpl);
-   CHECK(fd >= 0, "mkstemp for passthrough newline case");
-   if (fd < 0)
+   size_t len = 0;
+   int fd = -1;
+   char* buf = run_idxout(header, specs, ids, 1, footer, &len, &fd);
+   if (!buf)
       return;
-
-   idxout_t io;
-   CHECK(idxout_begin(&io, fd, doc, strlen(doc)) == 0, "idxout_begin");
-   CHECK(io.wrap == 0, "indexed source is passthrough");
-   CHECK(idxout_finish(&io) == 0, "idxout_finish");
-
-   struct stat st;
-   fstat(fd, &st);
-   CHECK((size_t)st.st_size == strlen(doc),
-         "no extra byte appended when input ends in newline");
-   lseek(fd, 0, SEEK_SET);
-   char* buf = malloc(strlen(doc) + 1);
-   CHECK(buf != NULL, "malloc");
-   if (buf) {
-      ssize_t got = read(fd, buf, strlen(doc));
-      CHECK(got == (ssize_t)strlen(doc), "read back");
-      CHECK(memcmp(buf, doc, strlen(doc)) == 0, "byte-identical passthrough");
-      CHECK(strstr(buf, "<indexListOffset") == NULL,
-            "no indexListOffset injected in passthrough");
-      free(buf);
+   CHECK(strstr(buf, "<indexList count=\"2\">") != NULL,
+         "indexList declares spectrum + chromatogram indexes");
+   const char* ci = strstr(buf, "<index name=\"chromatogram\">");
+   CHECK(ci != NULL, "chromatogram index present");
+   if (ci) {
+      const char* want[] = {"TIC", "BPC"};
+      const char* q = ci;
+      for (int i = 0; i < 2; i++) {
+         char needle[64];
+         snprintf(needle, sizeof(needle), "<offset idRef=\"%s\">", want[i]);
+         q = strstr(q, needle);
+         CHECK(q != NULL, "chromatogram idRef present, in order");
+         if (!q)
+            break;
+         unsigned long long off = strtoull(q + strlen(needle), NULL, 10);
+         char at[64];
+         snprintf(at, sizeof(at), "<chromatogram index=\"%d\" id=", i);
+         CHECK(off < len && strncmp(buf + off, at, strlen(at)) == 0,
+               "chromatogram offset lands on its element");
+      }
+   }
+   /* the spectrum index/checksum checks still hold */
+   const char* ck = strstr(buf, "<fileChecksum>");
+   if (ck) {
+      char hex[41], emitted[41];
+      sha1_hex(buf, (size_t)(ck + strlen("<fileChecksum>") - buf), hex);
+      CHECK(get_file_checksum(buf, emitted) == 0 && strcmp(hex, emitted) == 0,
+            "fileChecksum covers the chromatogram index too");
    }
    close(fd);
-   unlink(tmpl);
+   free(buf);
 }
 
 int main(void) {
@@ -554,8 +567,8 @@ int main(void) {
    RUN_TEST(test_wrap_without_footer_newline);
    RUN_TEST(test_wrap_declless_header);
    RUN_TEST(test_wrap_leading_whitespace_chunk);
-   RUN_TEST(test_passthrough_already_indexed);
-   RUN_TEST(test_passthrough_trailing_newline_kept);
+   RUN_TEST(test_indexed_source_gets_fresh_index);
+   RUN_TEST(test_chromatograms_indexed);
 
    printf("%d checks, %d failures\n", checks, failures);
    return failures ? 1 : 0;

@@ -768,41 +768,48 @@ void extract_msz(char* input_map, size_t input_filesize, long* indicies,
 
 /* extract.c — index-tracking output writer (idxout)
  *
- * Wraps the mzML stream emitted by extract_msz in <indexedmzML> and appends a
- * spectrum <indexList> of true absolute byte offsets plus the required
- * <indexListOffset> and the PSI <fileChecksum> (SHA-1 over the bytes from
- * <indexedmzML through </indexList>).
- * Raw-path msz store a bare <mzML> document, so they are wrapped; mzML-path
- * msz whose source document already opens with <indexedmzML pass through
- * verbatim (wrap=0), and finish() only guarantees a trailing newline.
+ * Every extraction is a new document (a subset of spectra, re-encoded
+ * arrays), so the writer always builds its own index: a spectrum (and, when
+ * the document has chromatograms, chromatogram) <indexList> of true absolute
+ * byte offsets, the required <indexListOffset>, and the PSI <fileChecksum> —
+ * SHA-1 over output byte 0 through the end of the "<fileChecksum>" open tag
+ * (mzML1.1.x_idx.xsd).
+ * Raw-path msz store a bare <mzML> document, which is wrapped in
+ * <indexedmzML> (wrap=1). mzML-path msz whose source already opens with
+ * <indexedmzML keep that wrapper (wrap=0); the source's index tail after
+ * </mzML> is dropped and replaced.
  */
 typedef struct {
    int fd;                    /* output */
    uint64_t written;          /* bytes emitted so far */
-   int wrap;                  /* 1 = we are wrapping (raw-path), 0 = passthrough */
-   uint64_t* spec_offsets;    /* absolute byte offset of each '<' of <spectrum */
+   int wrap;                  /* 1 = we emitted the <indexedmzML wrapper, 0 = source's */
+   uint64_t* spec_offsets;    /* absolute byte offset of each indexed element's '<' */
    char** spec_ids;           /* malloc'd copies of the escaped id attr bytes */
+   int* spec_types;           /* 0 = spectrum, 1 = chromatogram */
    size_t n_spec, cap_spec;
-   sha1_ctx sha;              /* running checksum from <indexedmzML through </indexList> */
+   sha1_ctx sha;              /* running checksum from output byte 0 */
    int last_nl;               /* private: most recent byte written was '\n' */
+   int in_tail;               /* private: past </mzML>; source bytes dropped */
 } idxout_t;
 
 int idxout_begin(idxout_t* io, int fd, const char* first_xml, size_t first_len);
-/* Writes "<?xml…?>\n<indexedmzML xmlns=…>\n" unless first_xml (after its own
-   <?xml…?> declaration) already starts with "<indexedmzML" — then
-   passthrough: emit first_xml verbatim, wrap=0. */
+/* Writes "<?xml…?>\n<indexedmzML xmlns=…>\n" then the document from its
+   <mzML root, unless first_xml (after its own <?xml…?> declaration) already
+   starts with "<indexedmzML" — then first_xml is emitted verbatim, wrap=0. */
 int idxout_write(idxout_t* io, const void* buf, size_t len); /* counts + sha */
+int idxout_write_scan(idxout_t* io, const char* buf, size_t len);
+/* Writes a chunk of complete tags, marking each <spectrum and <chromatogram
+   element in it for the index; emits through </mzML> and drops whatever
+   follows it (a source document's stale index tail). Use for chunks whose
+   elements the caller has not marked itself (footer, raw division bytes). */
 int idxout_mark_spectrum(idxout_t* io, const char* escaped_id);
 /* records spec_offsets = written at the moment the caller is about to
    emit '<' of "<spectrum "; call BEFORE idxout_write of that chunk. */
 int idxout_finish(idxout_t* io);
-/* wrap mode: appends indexList (one <offset idRef="ID">N</offset> per
-   spectrum, ids re-emitted verbatim/escaped-as-stored), updates sha over
-   it, emits <indexListOffset>N</indexListOffset> (N = byte offset of the
-   '<' of <indexList) then <fileChecksum>HEX</fileChecksum></indexedmzML>\n.
-   The sha span stays <indexedmzML .. </indexList> exactly. Passthrough:
-   no-op except ensuring the final byte written was '\n' (append one if
-   the stream didn't end with one). */
+/* Appends the indexList (one <offset idRef="ID">N</offset> per marked
+   element, ids re-emitted verbatim/escaped-as-stored), <indexListOffset>N
+   (N = byte offset of the '<' of <indexList), then
+   <fileChecksum>HEX</fileChecksum></indexedmzML>\n. */
 
 /* mzml_reindex.c — repairs an indexedmzML document's <indexList> offsets,
    <indexListOffset> and <fileChecksum> as decompress_msz streams it out
@@ -815,6 +822,10 @@ int mzml_reindex_write(mzml_reindex_t* rx, const char* buf, size_t len);
    source's index — right or wrong — is kept for a byte-exact restore). */
 int mzml_reindex_finish(mzml_reindex_t* rx, int repair);
 void mzml_reindex_free(mzml_reindex_t* rx);
+/* Sets every <binaryDataArray encodedLength> in buf[0, *len) to the length
+   of its <binary> text, reallocating *buf when digit counts change. Returns
+   the number of values changed, or -1 on allocation failure (buf intact). */
+long mzml_fix_encoded_lengths(char** buf, size_t* len);
 
 void extract_mzml_filtered(char* input_map, size_t input_filesize,
                            long* indicies, long indicies_length,

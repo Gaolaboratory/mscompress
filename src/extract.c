@@ -106,13 +106,36 @@ char* update_spectrum_list_count(char* header, size_t header_len,
    return result;
 }
 
+/* Returns the length of the longest prefix of buf[0, len) that does not end
+ * inside a tag: a trailing "<..." without its '>' is excluded so a tag split
+ * across two chunks reaches idxout_write_scan whole. */
+static size_t complete_tags_prefix(const char* buf, size_t len) {
+   for (size_t i = len; i > 0; i--) {
+      if (buf[i - 1] == '>')
+         return len;
+      if (buf[i - 1] == '<')
+         return i - 1;
+   }
+   return len;
+}
+
 /**
  * @brief Reconstructs and writes a complete mzML file from its divided streams.
+ *
+ * The divisions hold the selected spectra (preprocess_mzml filtered them), so
+ * the source document's own index no longer describes the output: it is
+ * written through the index writer, which records where each spectrum and
+ * chromatogram lands and replaces the index tail after </mzML>.
  * @param input_map The memory-mapped input buffer containing the original data.
  * @param divisions The divisions containing XML, m/z, and intensity position mappings.
  * @param output_fd The file descriptor to write the reconstructed mzML output to.
  */
 void extract_mzml(char* input_map, divisions_t* divisions, int output_fd) {
+   idxout_t idxout;
+   int started = 0;
+   char* carry = NULL; /* incomplete trailing tag of the previous division */
+   size_t carry_len = 0;
+
    for (int i = 0; i < divisions->n_divisions; i++) {
       division_t* division = divisions->divisions[i];
 
@@ -120,11 +143,23 @@ void extract_mzml(char* input_map, divisions_t* divisions, int output_fd) {
 
       long j = 0;
 
-      char* buff = malloc(division->size);
+      char* buff = malloc(division->size + carry_len);
+      if (buff == NULL) {
+         error("extract_mzml: Failed to allocate output buffer.\n");
+         break;
+      }
 
       long len = 0;
 
       long out_len = 0;
+
+      if (carry_len) {
+         memcpy(buff, carry, carry_len);
+         out_len = (long)carry_len;
+         free(carry);
+         carry = NULL;
+         carry_len = 0;
+      }
 
       int64_t xml_i = 0, mz_i = 0, inten_i = 0;
 
@@ -172,9 +207,55 @@ void extract_mzml(char* input_map, divisions_t* divisions, int output_fd) {
       out_len += len;
       xml_i++;
 
-      write_to_file(output_fd, buff, out_len);
+      size_t off = 0;
+      if (!started) {
+         /* The header (everything before the first <spectrum) decides
+          * whether the document needs an <indexedmzML wrapper. */
+         size_t hdr = (size_t)out_len;
+         for (size_t k = 0; k + 10 < (size_t)out_len; k++) {
+            if (buff[k] == '<' && memcmp(buff + k + 1, "spectrum", 8) == 0 &&
+                (buff[k + 9] == ' ' || buff[k + 9] == '\t' ||
+                 buff[k + 9] == '\n' || buff[k + 9] == '\r')) {
+               hdr = k;
+               break;
+            }
+         }
+         if (idxout_begin(&idxout, output_fd, buff, hdr) != 0) {
+            error("extract_mzml: Failed to initialize index output writer.\n");
+            free(buff);
+            return;
+         }
+         started = 1;
+         off = hdr;
+      }
+
+      size_t keep = (i + 1 < divisions->n_divisions)
+                        ? complete_tags_prefix(buff + off, (size_t)out_len - off)
+                        : (size_t)out_len - off;
+      if (idxout_write_scan(&idxout, buff + off, keep) != 0) {
+         free(buff);
+         break;
+      }
+      size_t rest = (size_t)out_len - off - keep;
+      if (rest) {
+         carry = malloc(rest);
+         if (carry == NULL) {
+            free(buff);
+            break;
+         }
+         memcpy(carry, buff + off + keep, rest);
+         carry_len = rest;
+      }
       free(buff);
    }
+
+   if (carry_len) {
+      if (started)
+         idxout_write_scan(&idxout, carry, carry_len);
+      free(carry);
+   }
+   if (started)
+      idxout_finish(&idxout);
    return;
 }
 
@@ -630,8 +711,16 @@ char* extract_spectrum_last_xml(char* input_map, ZSTD_DCtx* dctx,
       decmp_xml = xml_blk_len->cache;
    lru_touch_block(lru, xml_blk_len);
 
-   *out_len = (xml_end_position - xml_start_position) -
-              (xml_end_position - spectrum_end) + 1;  //+1 For newline
+   /* Through "</spectrum>", plus the separator after it when that is
+    * whitespace (normally the newline). Writers that put no separator
+    * between spectra (raw2ms: "</spectrum><spectrum") would otherwise leave
+    * the next spectrum's '<' on this chunk: "</spectrum><<spectrum". */
+   *out_len = spectrum_end - xml_start_position;
+   if (spectrum_end < xml_end_position) {
+      char sep = decmp_xml[xml_buff_offset + *out_len];
+      if (sep == '\n' || sep == '\r' || sep == ' ' || sep == '\t')
+         (*out_len)++;
+   }
    res = malloc(*out_len);
    memcpy(res, decmp_xml + xml_buff_offset, *out_len);
 
@@ -1277,18 +1366,20 @@ char* extract_spectra(char* input_map, ZSTD_DCtx* dctx, data_format_t* df,
 
 /*
  * Extraction reassembles an mzML document from spliced XML chunks and
- * re-encoded binary arrays, so any index the source document carried is
- * stale by construction. idxout streams the extracted output through one
- * place: it counts bytes from byte 0 of the output, and for stores holding a
- * bare <mzML> document (the raw path) it re-opens the document under
- * <indexedmzML> so a spectrum <indexList> of true absolute offsets and the
- * PSI <fileChecksum> can be appended. Stores whose document already opens
- * with <indexedmzML (the mzML path) pass through verbatim.
+ * re-encoded binary arrays, usually for a subset of the spectra, so any index
+ * the source document carried is stale by construction. idxout streams the
+ * extracted output through one place: it counts and hashes bytes from byte 0
+ * of the output, records where each spectrum and chromatogram lands, and
+ * appends a fresh <indexList>, <indexListOffset> and PSI <fileChecksum>.
+ * Stores holding a bare <mzML> document (the raw path) are re-opened under
+ * <indexedmzML>; stores whose document already opens with <indexedmzML (the
+ * mzML path) keep the source wrapper, and the source's index tail after
+ * </mzML> is dropped in favour of the fresh one.
  */
 
 /* Writes len bytes to io->fd (retrying short writes), maintaining the
- * absolute byte count, the trailing-newline state and — in wrap mode, when
- * hash is set — the running SHA-1 over <indexedmzML .. </indexList>.
+ * absolute byte count, the trailing-newline state and the running SHA-1
+ * (hash = 0 only for the checksum digest and what follows it).
  * Returns 0 on success, -1 on a write failure. */
 static int idxout_emit(idxout_t* io, const void* buf, size_t len, int hash) {
    const char* p = (const char*)buf;
@@ -1307,7 +1398,7 @@ static int idxout_emit(idxout_t* io, const void* buf, size_t len, int hash) {
       left -= (size_t)n;
    }
 
-   if (hash && io->wrap)
+   if (hash)
       sha1_update(&io->sha, buf, len);
    io->written += len;
    io->last_nl = (p[-1] == '\n');
@@ -1337,6 +1428,7 @@ int idxout_begin(idxout_t* io, int fd, const char* first_xml,
 
    memset(io, 0, sizeof(*io));
    io->fd = fd;
+   sha1_init(&io->sha);
    if (!first_xml)
       first_len = 0;
 
@@ -1363,19 +1455,17 @@ int idxout_begin(idxout_t* io, int fd, const char* first_xml,
    }
 
    if (rem >= 12 && memcmp(p, "<indexedmzML", 12) == 0) {
-      /* Source document already carries an index: emit it verbatim,
-       * declaration included; its own indexList travels with the stream. */
+      /* Source document already carries the wrapper: keep its header
+       * verbatim, declaration included. Its index tail is replaced in
+       * idxout_write_scan/idxout_finish. */
       io->wrap = 0;
-      return idxout_emit(io, first_xml, first_len, 0);
+      return idxout_emit(io, first_xml, first_len, 1);
    }
 
    io->wrap = 1;
-   sha1_init(&io->sha);
-   /* Our declaration sits outside the checksum span; the span starts at the
-    * first byte of <indexedmzML (PSI convention). */
    if (idxout_emit(io, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
                    sizeof("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n") - 1,
-                   0))
+                   1))
       return -1;
    if (idxout_emit(io, "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n",
                    sizeof("<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n") -
@@ -1388,124 +1478,196 @@ int idxout_begin(idxout_t* io, int fd, const char* first_xml,
 }
 
 int idxout_write(idxout_t* io, const void* buf, size_t len) {
+   if (io->in_tail)
+      return 0; /* past </mzML>: the source's stale index tail */
    return idxout_emit(io, buf, len, 1);
 }
 
-int idxout_mark_spectrum(idxout_t* io, const char* escaped_id) {
-   size_t id_len;
-   char* id;
-
-   if (!io->wrap)
-      return 0; /* passthrough: the source index stays authoritative */
-
-   if (!escaped_id) {
-      error("idxout_mark_spectrum: NULL spectrum id.\n");
-      return -1;
-   }
+static int idxout_mark(idxout_t* io, const char* id, size_t id_len, int type,
+                       uint64_t off) {
+   char* dup;
 
    if (io->n_spec == io->cap_spec) {
       size_t cap = io->cap_spec ? io->cap_spec * 2 : 64;
       uint64_t* offs = realloc(io->spec_offsets, cap * sizeof(uint64_t));
-      char** ids;
       if (!offs)
          return -1;
       io->spec_offsets = offs;
-      ids = realloc(io->spec_ids, cap * sizeof(char*));
+      char** ids = realloc(io->spec_ids, cap * sizeof(char*));
       if (!ids)
          return -1;
       io->spec_ids = ids;
+      int* types = realloc(io->spec_types, cap * sizeof(int));
+      if (!types)
+         return -1;
+      io->spec_types = types;
       io->cap_spec = cap;
    }
 
-   id_len = strlen(escaped_id);
-   id = malloc(id_len + 1);
-   if (!id)
+   dup = malloc(id_len + 1);
+   if (!dup)
       return -1;
-   memcpy(id, escaped_id, id_len + 1);
+   memcpy(dup, id, id_len);
+   dup[id_len] = '\0';
 
-   io->spec_offsets[io->n_spec] = io->written;
-   io->spec_ids[io->n_spec] = id;
+   io->spec_offsets[io->n_spec] = off;
+   io->spec_ids[io->n_spec] = dup;
+   io->spec_types[io->n_spec] = type;
    io->n_spec++;
    return 0;
+}
+
+int idxout_mark_spectrum(idxout_t* io, const char* escaped_id) {
+   if (!escaped_id) {
+      error("idxout_mark_spectrum: NULL spectrum id.\n");
+      return -1;
+   }
+   return idxout_mark(io, escaped_id, strlen(escaped_id), 0, io->written);
+}
+
+static int idx_is_ws(char c) {
+   return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+/* Value of attribute `id` (at an attribute boundary, so "nativeID" never
+ * matches) inside the open tag [p, gt). */
+static const char* idx_id_attr(const char* p, const char* gt, size_t* vlen) {
+   for (const char* q = p; q + 4 < gt; q++) {
+      if (!idx_is_ws(*q) || q[1] != 'i' || q[2] != 'd' || q[3] != '=')
+         continue;
+      char quote = q[4];
+      if (quote != '"' && quote != '\'')
+         continue;
+      const char* v = q + 5;
+      const char* e = memchr(v, quote, (size_t)(gt - v));
+      if (!e)
+         return NULL;
+      *vlen = (size_t)(e - v);
+      return v;
+   }
+   return NULL;
+}
+
+int idxout_write_scan(idxout_t* io, const char* buf, size_t len) {
+   const char* end = buf + len;
+   const char* q = buf;
+
+   if (io->in_tail)
+      return 0;
+
+   while (q < end) {
+      const char* lt = memchr(q, '<', (size_t)(end - q));
+      if (!lt)
+         break;
+      const char* gt = memchr(lt, '>', (size_t)(end - lt));
+      if (!gt)
+         break;
+      int type = -1;
+      if ((size_t)(end - lt) > 10 && memcmp(lt + 1, "spectrum", 8) == 0 &&
+          idx_is_ws(lt[9]))
+         type = 0;
+      else if ((size_t)(end - lt) > 14 &&
+               memcmp(lt + 1, "chromatogram", 12) == 0 && idx_is_ws(lt[13]))
+         type = 1;
+      if (type >= 0) {
+         size_t vlen;
+         const char* v = idx_id_attr(lt, gt, &vlen);
+         if (v && idxout_mark(io, v, vlen, type,
+                              io->written + (uint64_t)(lt - buf)) != 0)
+            return -1;
+      } else if (gt - lt == 6 && memcmp(lt, "</mzML", 6) == 0) {
+         /* Everything after </mzML> is the source's index tail (or
+          * nothing, for a bare <mzML> store): replaced at finish. */
+         int rv = idxout_emit(io, buf, (size_t)(gt + 1 - buf), 1);
+         io->in_tail = 1;
+         return rv;
+      }
+      q = gt + 1;
+   }
+   return idxout_emit(io, buf, len, 1);
+}
+
+/* Emits one <index name="..."> block holding the marked elements of `type`. */
+static int idxout_emit_index(idxout_t* io, int type) {
+   static const char* const names[] = {"spectrum", "chromatogram"};
+   char open[64];
+   int rv = 0;
+   int n = snprintf(open, sizeof(open), "<index name=\"%s\">\n", names[type]);
+   rv |= idxout_emit(io, open, (size_t)n, 1);
+
+   for (size_t i = 0; i < io->n_spec && rv == 0; i++) {
+      if (io->spec_types[i] != type)
+         continue;
+      /* The id's escaped bytes are re-emitted verbatim (valid inside
+       * id="…", hence valid inside idRef="…"). */
+      size_t need = strlen(io->spec_ids[i]) + 64;
+      char* line = malloc(need);
+      if (!line)
+         return -1;
+      n = snprintf(line, need, "<offset idRef=\"%s\">%llu</offset>\n",
+                   io->spec_ids[i], (unsigned long long)io->spec_offsets[i]);
+      if (n > 0 && (size_t)n < need)
+         rv |= idxout_emit(io, line, (size_t)n, 1);
+      else
+         rv = -1;
+      free(line);
+   }
+   rv |= idxout_emit(io, "</index>", sizeof("</index>") - 1, 1);
+   return rv;
 }
 
 int idxout_finish(idxout_t* io) {
    int rv = 0;
    size_t i;
+   uint64_t index_list_off;
+   size_t n_chrom = 0;
+   char buf[128];
+   int n;
 
-   if (io->wrap) {
-      uint64_t index_list_off;
+   for (i = 0; i < io->n_spec; i++)
+      n_chrom += io->spec_types[i] == 1;
 
-      /* Keep the index block on its own line; a newline inserted here is
-       * within the checksum span, so it is hashed like the rest. */
-      if (io->written > 0 && !io->last_nl)
-         rv |= idxout_emit(io, "\n", 1, 1);
+   /* Keep the index block on its own line. */
+   if (io->written > 0 && !io->last_nl)
+      rv |= idxout_emit(io, "\n", 1, 1);
 
-      /* Where <indexList begins: reported in <indexListOffset> so consumers
-       * can find the index from EOF. Recorded before the emit, hence exactly
-       * the '<' position. */
-      index_list_off = io->written;
+   /* Where <indexList begins: reported in <indexListOffset> so consumers
+    * can find the index from EOF. Recorded before the emit, hence exactly
+    * the '<' position. */
+   index_list_off = io->written;
 
-      rv |= idxout_emit(io,
-                        "<indexList count=\"1\"><index name=\"spectrum\">\n",
-                        sizeof("<indexList count=\"1\"><index name=\"spectrum\">\n") -
-                            1,
-                        1);
+   n = snprintf(buf, sizeof(buf), "<indexList count=\"%d\">",
+                n_chrom ? 2 : 1);
+   rv |= idxout_emit(io, buf, (size_t)n, 1);
+   rv |= idxout_emit_index(io, 0);
+   if (n_chrom)
+      rv |= idxout_emit_index(io, 1);
 
-      for (i = 0; i < io->n_spec && rv == 0; i++) {
-         /* One <offset> per spectrum actually emitted; the id's escaped
-          * bytes are re-emitted verbatim (valid inside id="…", hence valid
-          * inside idRef="…"). */
-         size_t need = strlen(io->spec_ids[i]) + 64;
-         char* line = malloc(need);
-         int n;
-         if (!line) {
-            rv = -1;
-            break;
-         }
-         n = snprintf(line, need, "<offset idRef=\"%s\">%llu</offset>\n",
-                      io->spec_ids[i],
-                      (unsigned long long)io->spec_offsets[i]);
-         if (n > 0 && (size_t)n < need)
-            rv |= idxout_emit(io, line, (size_t)n, 1);
-         else
-            rv = -1;
-         free(line);
+   /* The checksum covers output byte 0 through the end of the
+    * "<fileChecksum>" open tag (mzML1.1.x_idx.xsd). */
+   n = snprintf(buf, sizeof(buf),
+                "</indexList>\n<indexListOffset>%llu</indexListOffset>"
+                "<fileChecksum>",
+                (unsigned long long)index_list_off);
+   if (n > 0 && (size_t)n < sizeof(buf))
+      rv |= idxout_emit(io, buf, (size_t)n, 1);
+   else
+      rv = -1;
+
+   if (rv == 0) {
+      uint8_t digest[20];
+      char hex[41];
+      static const char digits[] = "0123456789abcdef";
+
+      sha1_final(&io->sha, digest);
+      for (i = 0; i < 20; i++) {
+         hex[i * 2] = digits[digest[i] >> 4];
+         hex[i * 2 + 1] = digits[digest[i] & 0x0F];
       }
-
-      /* The last byte of </indexList> closes the checksum span. */
-      rv |= idxout_emit(io, "</index></indexList>",
-                        sizeof("</index></indexList>") - 1, 1);
-
-      if (rv == 0) {
-         uint8_t digest[20];
-         char hex[41];
-         char tail[41 + 128];
-         int n;
-         static const char digits[] = "0123456789abcdef";
-
-         sha1_final(&io->sha, digest);
-         for (i = 0; i < 20; i++) {
-            hex[i * 2] = digits[digest[i] >> 4];
-            hex[i * 2 + 1] = digits[digest[i] & 0x0F];
-         }
-         hex[40] = '\0';
-
-         /* <indexListOffset> and the checksum element itself are outside
-          * the span the checksum covers (<indexedmzML .. </indexList>). */
-         n = snprintf(tail, sizeof(tail),
-                      "\n<indexListOffset>%llu</indexListOffset>"
-                      "<fileChecksum>%s</fileChecksum></indexedmzML>\n",
-                      (unsigned long long)index_list_off, hex);
-         if (n > 0 && (size_t)n < sizeof(tail))
-            rv |= idxout_emit(io, tail, (size_t)n, 0);
-         else
-            rv = -1;
-      }
-   } else {
-      /* Passthrough: only guarantee the stream is newline-terminated. */
-      if (io->written > 0 && !io->last_nl)
-         rv |= idxout_emit(io, "\n", 1, 0);
+      hex[40] = '\0';
+      rv |= idxout_emit(io, hex, 40, 0);
+      rv |= idxout_emit(io, "</fileChecksum></indexedmzML>\n",
+                        sizeof("</fileChecksum></indexedmzML>\n") - 1, 0);
    }
 
    if (io->spec_ids)
@@ -1513,8 +1675,10 @@ int idxout_finish(idxout_t* io) {
          free(io->spec_ids[i]);
    free(io->spec_ids);
    free(io->spec_offsets);
+   free(io->spec_types);
    io->spec_ids = NULL;
    io->spec_offsets = NULL;
+   io->spec_types = NULL;
    io->n_spec = io->cap_spec = 0;
 
    return rv ? -1 : 0;
@@ -1673,9 +1837,10 @@ void extract_msz(char* input_map, size_t input_filesize, long* indicies,
    char* updated_header = update_spectrum_list_count(
        mzml_header, header_len, indicies_length, &updated_header_len);
 
-   // All output goes through the index writer: it either wraps the document
-   // in <indexedmzML> and appends a true spectrum index (raw-path msz, bare
-   // <mzML> store) or passes an already-indexed source through verbatim.
+   // All output goes through the index writer: it wraps a bare <mzML> store
+   // (raw path) in <indexedmzML>, keeps an indexed source's wrapper (mzML
+   // path), and in both cases appends a fresh index of the extracted
+   // spectra and chromatograms plus the PSI fileChecksum.
    idxout_t idxout;
    const char* first_xml = updated_header ? updated_header : mzml_header;
    size_t first_len =
@@ -1701,6 +1866,13 @@ void extract_msz(char* input_map, size_t input_filesize, long* indicies,
       if (spectrum == NULL) {
          error("extract_msz: Failed to extract spectrum index %ld.\n",
                indicies[i]);
+         goto finish_output;
+      }
+
+      // Re-encoded arrays rarely keep the source's base64 length.
+      if (mzml_fix_encoded_lengths(&spectrum, &spectra_len) < 0) {
+         error("extract_msz: Out of memory fixing encodedLength.\n");
+         free(spectrum);
          goto finish_output;
       }
 
@@ -1752,7 +1924,7 @@ void extract_msz(char* input_map, size_t input_filesize, long* indicies,
    }
    char* mzml_footer = extract_mzml_footer(decmp_xml, divisions, &footer_len);
    // print("%s\n", mzml_footer);
-   if (idxout_write(&idxout, mzml_footer, footer_len) != 0) {
+   if (idxout_write_scan(&idxout, mzml_footer, footer_len) != 0) {
       free(mzml_footer);
       goto finish_output;
    }
@@ -1800,17 +1972,22 @@ void extract_mzml_filtered(char* input_map, size_t input_filesize,
           map_scan_to_index(scans, scans_length, division, 0, &indicies_length);
    }
 
-   // Write header with updated spectrumList count
+   // Output goes through the index writer, as in extract_msz: the source's
+   // index describes the whole file, so the subset gets a fresh one.
+   idxout_t idxout;
    size_t header_len = division->spectra->start_positions[0];
    size_t updated_header_len = 0;
    char* updated_header = update_spectrum_list_count(
        input_map, header_len, indicies_length, &updated_header_len);
-   if (updated_header) {
-      write_to_file(output_fd, updated_header, updated_header_len);
-      free(updated_header);
-   } else {
-      // Fallback: write original header
-      write_to_file(output_fd, input_map, header_len);
+   int rv = updated_header
+                ? idxout_begin(&idxout, output_fd, updated_header,
+                               updated_header_len)
+                : idxout_begin(&idxout, output_fd, input_map, header_len);
+   free(updated_header);
+   if (rv != 0) {
+      error("extract_mzml_filtered: Failed to initialize index output "
+            "writer.\n");
+      goto cleanup;
    }
 
    // Write spectra
@@ -1818,17 +1995,35 @@ void extract_mzml_filtered(char* input_map, size_t input_filesize,
       long idx = indicies[i];
       size_t start = division->spectra->start_positions[idx];
       size_t end = division->spectra->end_positions[idx];
+      const char* chunk = input_map + start;
       size_t len = end - start;
-      write_to_file(output_fd, input_map + start, len);
-      write_to_file(output_fd, "\n", 1);
+      size_t lead = 0;
+      char* spec_id = spectrum_id_from_chunk(chunk, len, &lead);
+      if (spec_id == NULL) {
+         error("extract_mzml_filtered: Spectrum index %ld has no parsable "
+               "<spectrum id=\"...\" attribute; cannot index.\n",
+               idx);
+         goto finish_output;
+      }
+      rv = (lead > 0 && idxout_write(&idxout, chunk, lead) != 0) ||
+           idxout_mark_spectrum(&idxout, spec_id) != 0 ||
+           idxout_write(&idxout, chunk + lead, len - lead) != 0 ||
+           idxout_write(&idxout, "\n", 1) != 0;
+      free(spec_id);
+      if (rv)
+         goto finish_output;
    }
 
-   // Write footer
+   // Write footer (through </mzML>; the source's index tail is replaced)
    size_t last_spec_end =
        division->spectra->end_positions[division->spectra->total_spec - 1];
    size_t footer_len = input_filesize - last_spec_end;
-   write_to_file(output_fd, input_map + last_spec_end, footer_len);
+   idxout_write_scan(&idxout, input_map + last_spec_end, footer_len);
 
+finish_output:
+   idxout_finish(&idxout);
+
+cleanup:
    // Cleanup allocated indices if necessary
    if (ms_level != 0 || scans_length > 0) {
       if (indicies)

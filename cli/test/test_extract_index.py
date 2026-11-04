@@ -6,18 +6,17 @@ spectrum index really lands on <spectrum elements.
 Usage: test_extract_index.py <mscompress> <workdir>
 
 Leg 1 (always): test/data/test.mzML -> msz -> --extract. The fixture is an
-indexed mzML, so extraction passes the stored document through verbatim: the
-test asserts no double wrapping (exactly one <indexedmzML) and that the
-source's own index block survived byte-for-byte. The fixture was made by
-truncating a 431 MB run, so its inherited indexList is stale by construction
-(41,608 offsets for 50 spectra, many past EOF); offset-landing is therefore
-asserted on the raw leg only, where extraction builds a fresh true index.
+indexed mzML whose own indexList is stale (it was made by truncating a 431 MB
+run: 41,608 offsets for 50 spectra, many past EOF). Extraction keeps the
+source's <indexedmzML wrapper (no double wrapping) but must drop that stale
+index and build a fresh one, so the full gate applies: every offset lands, the
+index holds exactly the extracted spectra, and the PSI fileChecksum verifies.
 
 Leg 2 (only when $MSC_RAW_FIXTURE points at a vendor raw): convert the raw to
 msz via raw2ms, extract in full and filtered, and assert the full gate:
 newline termination, single indexedmzML wrapper, every spectrum offset
-seek-lands on b'<spectrum', PSI fileChecksum recomputes over the
-<indexedmzML .. </indexList> span, sane isolation windows (low <= target <=
+seek-lands on b'<spectrum', PSI fileChecksum recomputes over byte 0 through
+the end of the "<fileChecksum>" open tag, sane isolation windows (low <= target <=
 high in offset terms, width in (0, 1000], no zero offsets around a set
 target), exactly one peak-mode label per spectrum, selected-ion m/z in every
 precursor, and a pyteomics indexed parse that yields the same count as the
@@ -147,10 +146,11 @@ def check_fresh_index(tag, data, offsets, expected_count):
     m = re.search(rb"<fileChecksum>([0-9a-f]+)</fileChecksum>", data)
     if not check("%s: <fileChecksum> present" % tag, m is not None):
         return
-    start = data.index(b"<indexedmzML")  # span starts at the wrapper itself
-    end = data.rindex(b"</indexList>") + len(b"</indexList>")
-    digest = hashlib.sha1(data[start:end]).hexdigest()
-    check("%s: fileChecksum == SHA-1 over <indexedmzML .. </indexList>" % tag,
+    # mzML1.1.x_idx.xsd: "SHA-1 checksum from beginning of file to end of
+    # 'fileChecksum' open tag".
+    end = data.index(b"<fileChecksum>") + len(b"<fileChecksum>")
+    digest = hashlib.sha1(data[:end]).hexdigest()
+    check("%s: fileChecksum == SHA-1 over byte 0 .. <fileChecksum>" % tag,
           digest == m.group(1).decode(),
           "recomputed %s, file says %s" % (digest, m.group(1).decode()))
     # <indexListOffset> is a required indexedmzML child: it must name the
@@ -257,7 +257,7 @@ def scan_numbers(idrefs):
 
 
 def leg_mzml(mscompress, workdir):
-    print("leg 1: mzML path (repo fixture, indexed source -> passthrough)")
+    print("leg 1: mzML path (repo fixture, indexed source -> fresh index)")
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "..", "..", "test", "data", "test.mzML")
     src = os.path.abspath(src)
@@ -266,7 +266,7 @@ def leg_mzml(mscompress, workdir):
     with open(src, "rb") as f:
         source = f.read()
     src_index_at = source.find(b"<indexList count=")
-    check("leg 1: fixture opens as indexed mzML (test expects passthrough)",
+    check("leg 1: fixture opens as indexed mzML (test expects its stale index replaced)",
           src_index_at != -1 and b"<indexedmzML" in source[:200],
           "fixture layout changed; update this leg")
 
@@ -295,13 +295,14 @@ def leg_mzml(mscompress, workdir):
                  re.findall(rb'<spectrum [^>]*?scan=(\d+)', data)]
     check("leg 1: extracted scan ids match the source, in order",
           out_scans == src_scans, "body scans differ from the source fixture")
-    # The brief's no-double-wrap + surviving-index assertions for an
-    # already-indexed source. Offsets themselves are the fixture's own
-    # (stale by construction), so they are not seek-verified here.
-    out_index_at = data.find(b"<indexList count=")
-    check("leg 1: original <indexList survived extraction byte-for-byte",
-          out_index_at != -1 and source[src_index_at:] == data[out_index_at:],
-          "trailing index block differs from the source fixture")
+    # The source's index was stale; the output must carry a fresh one that
+    # verifies end to end, and only one indexList.
+    _, offsets = parse_spectrum_index(data)
+    if offsets:
+        check_fresh_index("leg 1", data, offsets, n_body)
+    check("leg 1: stale source indexList replaced, not kept alongside",
+          data.count(b"<indexList ") == 1,
+          "%d <indexList elements" % data.count(b"<indexList "))
 
 
 def leg_raw(mscompress, workdir):
