@@ -223,6 +223,7 @@ decompress_args_t* alloc_decompress_args(
 
    r->ret = NULL;
    r->ret_len = 0;
+   r->n_len_fixed = 0;
 
    return r;
 }
@@ -263,6 +264,73 @@ int get_lowest(int i_0, int i_1, int i_2) {
       ret = 2;
 
    return ret;
+}
+
+/**
+ * @brief Rewrites the encodedLength attribute of the <binaryDataArray> that
+ * owns the array just re-encoded at buff[bin_start, bin_start + bin_len).
+ *
+ * The XML stream stores the source document's attribute verbatim, but the
+ * re-encoded base64 (re-deflated zlib, lossy transforms) rarely has the
+ * source's length. The attribute lives in the XML segment that precedes the
+ * array, [seg_start, bin_start). When the digit count changes, the bytes from
+ * the attribute to the end of the array shift by the difference.
+ *
+ * Increments *n_fixed when the value changed.
+ * @return The byte shift applied (0 when unchanged or no attribute found),
+ * or INT64_MIN when the buffer could not grow.
+ */
+static int64_t fix_encoded_length(char** buff, size_t* cap, int64_t seg_start,
+                                  int64_t bin_start, size_t bin_len,
+                                  long* n_fixed) {
+   static const char tag[] = "<binaryDataArray";
+   static const char attr[] = "encodedLength=\"";
+   const size_t tl = sizeof(tag) - 1, al = sizeof(attr) - 1;
+   char* b = *buff;
+
+   if (seg_start < 0 || bin_start - seg_start < (int64_t)(tl + al))
+      return 0;
+
+   /* last <binaryDataArray in the segment */
+   char* t = NULL;
+   for (int64_t i = bin_start - (int64_t)tl; i >= seg_start; i--) {
+      if (b[i] == '<' && memcmp(b + i, tag, tl) == 0) {
+         t = b + i;
+         break;
+      }
+   }
+   if (t == NULL) return 0;
+   char* gt = memchr(t, '>', (size_t)(b + bin_start - t));
+   if (gt == NULL) return 0;
+
+   char* v = NULL;
+   for (char* q = t + tl; q + al <= gt; q++) {
+      if (memcmp(q, attr, al) == 0 && (q[-1] == ' ' || q[-1] == '\t' ||
+                                       q[-1] == '\n' || q[-1] == '\r')) {
+         v = q + al;
+         break;
+      }
+   }
+   if (v == NULL) return 0;
+   char* ve = memchr(v, '"', (size_t)(gt - v));
+   if (ve == NULL) return 0;
+
+   char num[32];
+   int n = snprintf(num, sizeof(num), "%zu", bin_len);
+   size_t old_n = (size_t)(ve - v);
+   if (old_n == (size_t)n && memcmp(v, num, old_n) == 0) return 0;
+
+   (*n_fixed)++;
+   int64_t delta = (int64_t)n - (int64_t)old_n;
+   size_t v_off = (size_t)(v - b), ve_off = (size_t)(ve - b);
+   size_t tail = (size_t)(bin_start + (int64_t)bin_len) - ve_off;
+   if (delta > 0 &&
+       grow_buff(buff, cap, (size_t)(bin_start + (int64_t)bin_len + delta)))
+      return INT64_MIN;
+   b = *buff;
+   if (delta != 0) memmove(b + ve_off + delta, b + ve_off, tail);
+   memcpy(b + v_off, num, (size_t)n);
+   return delta;
 }
 
 #ifdef _WIN32
@@ -355,6 +423,8 @@ void* decompress_routine(void* args) {
 
    int block = 0;
    int enc_ret;
+   int64_t seg_start = -1;  // start of the XML segment preceding an array
+   int64_t shift;
 
    long len = division->size;
 
@@ -424,6 +494,7 @@ void* decompress_routine(void* args) {
             curr_len =
                 curr_dp->end_positions[xml_i] - curr_dp->start_positions[xml_i];
             if (curr_len == 0) {
+               seg_start = -1;  // no XML before the next array to patch
                xml_i++;
                block++;
                break;
@@ -437,6 +508,7 @@ void* decompress_routine(void* args) {
                return NULL;
             }
             db_args->ret = buff;
+            seg_start = buff_off;
             memcpy(buff + buff_off, decmp_xml + xml_off, curr_len);
             xml_off += curr_len;
             buff_off += curr_len;
@@ -483,6 +555,20 @@ void* decompress_routine(void* args) {
                return NULL;
             }
 
+            shift = fix_encoded_length(&buff, &buff_cap, seg_start, buff_off,
+                                       *a_args->dest_len,
+                                       &db_args->n_len_fixed);
+            db_args->ret = buff;
+            if (shift == INT64_MIN) {
+               error("decompress_routine: Failed to grow output buffer.\n");
+               dealloc_z_stream(a_args->z);
+               dealloc_z_stream_inflate(a_args->z_inflate);
+               free(a_args);
+               return NULL;
+            }
+            buff_off += shift;
+            seg_start = -1;
+
             buff_off += *a_args->dest_len;
             mz_i++;
             block++;
@@ -496,6 +582,7 @@ void* decompress_routine(void* args) {
             curr_len =
                 curr_dp->end_positions[xml_i] - curr_dp->start_positions[xml_i];
             if (curr_len == 0) {
+               seg_start = -1;  // no XML before the next array to patch
                xml_i++;
                block++;
                break;
@@ -509,6 +596,7 @@ void* decompress_routine(void* args) {
                return NULL;
             }
             db_args->ret = buff;
+            seg_start = buff_off;
             memcpy(buff + buff_off, decmp_xml + xml_off, curr_len);
             xml_off += curr_len;
             buff_off += curr_len;
@@ -554,6 +642,20 @@ void* decompress_routine(void* args) {
                free(a_args);
                return NULL;
             }
+
+            shift = fix_encoded_length(&buff, &buff_cap, seg_start, buff_off,
+                                       *a_args->dest_len,
+                                       &db_args->n_len_fixed);
+            db_args->ret = buff;
+            if (shift == INT64_MIN) {
+               error("decompress_routine: Failed to grow output buffer.\n");
+               dealloc_z_stream(a_args->z);
+               dealloc_z_stream_inflate(a_args->z_inflate);
+               free(a_args);
+               return NULL;
+            }
+            buff_off += shift;
+            seg_start = -1;
             
             buff_off += *a_args->dest_len;
             inten_i++;
@@ -665,6 +767,15 @@ int decompress_msz(char* input_map, size_t input_filesize,
          footer_inten_bin_off += inten_binary_blk->compressed_size;
    }
 
+   /* Output goes through the reindexer, which repairs the index tail of an
+    * indexedmzML document once every division has been written. */
+   mzml_reindex_t* rx = mzml_reindex_new(fd);
+   long n_len_fixed = 0;
+   if (rx == NULL) {
+      error("decompress_msz: Failed to allocate the mzML reindexer.\n");
+      return -1;
+   }
+
    while (divisions_left > 0) {
       if (divisions_left < threads)
          threads = divisions_left;
@@ -705,17 +816,33 @@ int decompress_msz(char* input_map, size_t input_filesize,
             return -1;
          }
          start = get_time();
-         write_to_file(fd, args[i]->ret, args[i]->ret_len);
+         if (mzml_reindex_write(rx, args[i]->ret, (size_t)args[i]->ret_len)) {
+            error("decompress_msz: Failed to write division %d.\n", i);
+            mzml_reindex_free(rx);
+            return -1;
+         }
          stop = get_time();
 
          print("\tWrote %ld bytes to disk (%1.2fmb/s)\n", args[i]->ret_len,
                (float)args[i]->ret_len / (stop - start) / 1024 / 1024);
 
+         n_len_fixed += args[i]->n_len_fixed;
          dealloc_decompress_args(args[i]);
       }
 
       divisions_left -= threads;
       divisions_used += threads;
+   }
+
+   if (n_len_fixed > 0)
+      print("\tRe-encoded %ld binary arrays to a different length than the "
+            "source; updated their encodedLength.\n",
+            n_len_fixed);
+   int fin = mzml_reindex_finish(rx, n_len_fixed > 0);
+   mzml_reindex_free(rx);
+   if (fin != 0) {
+      error("decompress_msz: Failed to write the mzML index.\n");
+      return -1;
    }
 
    free(args);

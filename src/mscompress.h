@@ -804,6 +804,18 @@ int idxout_finish(idxout_t* io);
    no-op except ensuring the final byte written was '\n' (append one if
    the stream didn't end with one). */
 
+/* mzml_reindex.c — repairs an indexedmzML document's <indexList> offsets,
+   <indexListOffset> and <fileChecksum> as decompress_msz streams it out
+   (re-encoded arrays move bytes). Non-indexed documents pass through. */
+typedef struct mzml_reindex mzml_reindex_t;
+mzml_reindex_t* mzml_reindex_new(int fd);
+int mzml_reindex_write(mzml_reindex_t* rx, const char* buf, size_t len);
+/* Writes the held index tail. repair != 0 patches offsets, indexListOffset
+   and fileChecksum; 0 writes it verbatim (output bytes did not move, so the
+   source's index — right or wrong — is kept for a byte-exact restore). */
+int mzml_reindex_finish(mzml_reindex_t* rx, int repair);
+void mzml_reindex_free(mzml_reindex_t* rx);
+
 void extract_mzml_filtered(char* input_map, size_t input_filesize,
                            long* indicies, long indicies_length,
                            uint32_t* scans, long scans_length,
@@ -902,6 +914,7 @@ typedef struct {
 
    char* ret;
    size_t ret_len;
+   long n_len_fixed; /* arrays whose encodedLength differed from the source */
 
 } decompress_args_t;
 

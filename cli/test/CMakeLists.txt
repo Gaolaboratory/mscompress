@@ -157,6 +157,19 @@ add_test(NAME BatchIndexTest
     -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test_index.cmake
 )
 
+# Decompressing an indexedmzML whose zlib arrays re-deflate to new lengths
+# must rewrite encodedLength, the <indexList> offsets, <indexListOffset> and
+# <fileChecksum>; a document whose arrays round-trip unchanged stays
+# byte-exact.
+add_test(NAME ReindexTest
+    COMMAND ${CMAKE_COMMAND}
+    -DEXECUTABLE=$<TARGET_FILE:mscompress>
+    -DTEST_MZML=${TEST_DATA_DIR}/raw2ms_zlib_indexed.mzML
+    -DBYTE_EXACT_MZML=${TEST_DATA_DIR}/test.mzML
+    -DTEMP_DIR=${CMAKE_CURRENT_BINARY_DIR}/tmp_reindex
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/run_test_reindex.cmake
+)
+
 # Helper macro to add simple tests
 macro(add_cli_test TEST_NAME ARGS)
     add_test(NAME ${TEST_NAME}
