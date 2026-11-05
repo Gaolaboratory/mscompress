@@ -1012,7 +1012,11 @@ cdef class MSZFile(BaseFile):
         _require_msz_version(self._mapping, self.filesize)
         self._df = _get_header_df(self._mapping)
         self._footer = _read_footer(self._mapping, self.filesize)
-        self._divisions = _read_divisions(self._mapping, self._footer.divisions_t_pos, self._footer.n_divisions)
+        if self._footer == NULL:
+            raise ValueError("Not a valid .msz file: footer not found")
+        self._divisions = _read_divisions_checked(self._mapping, self._footer, self.filesize)
+        if self._divisions == NULL:
+            raise ValueError("Corrupt .msz file: footer/division table is inconsistent (truncated or overwritten?)")
         self._positions = NULL  # built lazily via _ensure_positions()
         self._build_offsets()
         self._dctx = _alloc_dctx()
@@ -1166,7 +1170,11 @@ cdef class MSZFile(BaseFile):
         _require_msz_version(self._mapping, self.filesize)
         self._df = _get_header_df(self._mapping)
         self._footer = _read_footer(self._mapping, self.filesize)
-        self._divisions = _read_divisions(self._mapping, self._footer.divisions_t_pos, self._footer.n_divisions)
+        if self._footer == NULL:
+            raise ValueError("Not a valid .msz file: footer not found")
+        self._divisions = _read_divisions_checked(self._mapping, self._footer, self.filesize)
+        if self._divisions == NULL:
+            raise ValueError("Corrupt .msz file: footer/division table is inconsistent (truncated or overwritten?)")
         self._positions = NULL  # built lazily via _ensure_positions()
         self._build_offsets()
         self._dctx = _alloc_dctx()

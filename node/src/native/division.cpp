@@ -66,9 +66,9 @@ Napi::Value ReadMszDivisions(const Napi::CallbackInfo& info) {
     handle->SetFooter(footer);
 
     // Read divisions from footer
-    divisions_t* divisions = read_divisions(handle->GetMapping(), footer->divisions_t_pos, footer->n_divisions);
+    divisions_t* divisions = read_divisions_checked(handle->GetMapping(), footer, static_cast<long>(handle->GetFilesize()));
     if (divisions == nullptr) {
-        Napi::Error::New(env, "readMszDivisions: failed to read divisions").ThrowAsJavaScriptException();
+        Napi::Error::New(env, "readMszDivisions: corrupt .msz file (footer/division table is inconsistent; truncated or overwritten?)").ThrowAsJavaScriptException();
         return env.Null();
     }
     handle->SetDivisions(divisions);

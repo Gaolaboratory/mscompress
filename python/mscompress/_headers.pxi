@@ -179,6 +179,7 @@ cdef extern from "../src/mscompress.h":
     const char* MIN_SUPPORT
     const char* MAX_SUPPORT
     divisions_t* _read_divisions "read_divisions"(void* input_map, long position, int n_divisions)
+    divisions_t* _read_divisions_checked "read_divisions_checked"(void* input_map, const footer_t* footer, long filesize)
     division_t* _flatten_divisions "flatten_divisions"(divisions_t* divisions)
     block_len_queue_t* _read_block_len_queue "read_block_len_queue"(void* input_map, long offset, long end)
     block_len_t* _get_block_by_index "get_block_by_index"(block_len_queue_t* queue, int index)

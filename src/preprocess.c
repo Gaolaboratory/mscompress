@@ -2694,6 +2694,181 @@ int preprocess_external(char* input_map, long input_filesize, long* blocksize,
 }
 
 /**
+ * @brief Structurally validates a footer against the file it was read from.
+ *
+ * Checks that the stream, block-table and division offsets are ordered, lie
+ * inside the file and leave room for the footer, so a truncated, overwritten
+ * or concatenated .msz is rejected instead of being dereferenced.
+ *
+ * @return 0 if the footer is consistent, -1 (after printing why) otherwise.
+ */
+int validate_footer(const footer_t* f, long filesize) {
+   const char* why = NULL;
+   uint64_t eof, blk_bytes[3];
+
+   if (f == NULL)
+      return -1;
+   if (filesize < (long)(HEADER_SIZE + sizeof(footer_t))) {
+      error("Corrupt .msz: file too small (%ld bytes).\n", filesize);
+      return -1;
+   }
+   eof = (uint64_t)filesize - sizeof(footer_t); /* where the footer begins */
+
+   if (f->xml_pos < HEADER_SIZE || f->xml_pos > f->mz_binary_pos ||
+       f->mz_binary_pos > f->inten_binary_pos ||
+       f->inten_binary_pos > f->xml_blk_pos ||
+       f->xml_blk_pos > f->mz_binary_blk_pos ||
+       f->mz_binary_blk_pos > f->inten_binary_blk_pos ||
+       f->inten_binary_blk_pos > f->divisions_t_pos ||
+       f->divisions_t_pos > eof)
+      why = "footer offsets are out of order or outside the file";
+   else {
+      blk_bytes[0] = f->mz_binary_blk_pos - f->xml_blk_pos;
+      blk_bytes[1] = f->inten_binary_blk_pos - f->mz_binary_blk_pos;
+      blk_bytes[2] = f->divisions_t_pos - f->inten_binary_blk_pos;
+      if (blk_bytes[0] % (2 * sizeof(size_t)) ||
+          blk_bytes[1] % (2 * sizeof(size_t)) ||
+          blk_bytes[2] % (2 * sizeof(size_t)))
+         why = "block length tables are misaligned";
+      else if (f->n_divisions <= 0)
+         why = "invalid division count";
+   }
+
+   if (why != NULL) {
+      error("Corrupt .msz: %s (file size %ld, footer at %llu, divisions at "
+            "%llu). The file is likely truncated, overwritten or was written "
+            "by concurrent processes; re-create it from the source data.\n",
+            why, filesize, (unsigned long long)eof,
+            (unsigned long long)f->divisions_t_pos);
+      return -1;
+   }
+   return 0;
+}
+
+/* Bounds-checked variants of read_dp/read_division: every read must stay
+ * below `end` (the start of the footer). Return NULL on overrun. */
+static int msz_have(uint64_t pos, uint64_t need, uint64_t end) {
+   return pos <= end && need <= end - pos;
+}
+
+static data_positions_t* read_dp_checked(void* map, long* position,
+                                         uint64_t end) {
+   uint64_t pos = (uint64_t)*position, n;
+   data_positions_t* r;
+
+   if (!msz_have(pos, sizeof(uint64_t), end))
+      return NULL;
+   n = *((uint64_t*)((uint8_t*)map + pos));
+   pos += sizeof(uint64_t);
+   if (n > (end - pos) / (2 * sizeof(uint64_t)))
+      return NULL;
+
+   r = malloc(sizeof(data_positions_t));
+   if (r == NULL)
+      return NULL;
+   r->total_spec = n;
+   r->start_positions = (uint64_t*)((uint8_t*)map + pos);
+   pos += sizeof(uint64_t) * n;
+   r->end_positions = (uint64_t*)((uint8_t*)map + pos);
+   pos += sizeof(uint64_t) * n;
+   *position = (long)pos;
+   return r;
+}
+
+static int read_arr_checked(void* map, long* position, uint64_t end,
+                            size_t elem, void** out) {
+   uint64_t pos = (uint64_t)*position, n;
+
+   if (!msz_have(pos, sizeof(uint32_t), end))
+      return -1;
+   n = *((uint32_t*)((uint8_t*)map + pos));
+   pos += sizeof(uint32_t);
+   if (n > (end - pos) / elem)
+      return -1;
+   *out = (uint8_t*)map + pos;
+   *position = (long)(pos + n * elem);
+   return 0;
+}
+
+static division_t* read_division_checked(void* map, long* position,
+                                         uint64_t end) {
+   division_t* r = calloc(1, sizeof(division_t));
+   void* arr;
+   if (r == NULL)
+      return NULL;
+
+   r->spectra = read_dp_checked(map, position, end);
+   if (r->spectra) r->xml = read_dp_checked(map, position, end);
+   if (r->xml) r->mz = read_dp_checked(map, position, end);
+   if (r->mz) r->inten = read_dp_checked(map, position, end);
+   if (!r->inten || !msz_have((uint64_t)*position, sizeof(uint64_t), end))
+      goto fail;
+   r->size = *((uint64_t*)((uint8_t*)map + *position));
+   *position += sizeof(uint64_t);
+
+   if (read_arr_checked(map, position, end, sizeof(uint32_t), &arr) != 0)
+      goto fail;
+   r->scans = (uint32_t*)arr;
+   if (read_arr_checked(map, position, end, sizeof(uint16_t), &arr) != 0)
+      goto fail;
+   r->ms_levels = (uint16_t*)arr;
+   return r;
+
+fail:
+   dealloc_read_division(r);
+   return NULL;
+}
+
+/**
+ * @brief Validates the footer, then reads its divisions with bounds checking.
+ *
+ * Safe replacement for `read_divisions(map, footer->divisions_t_pos, n)` on
+ * untrusted files. The divisions must end exactly where the footer begins.
+ *
+ * @return The divisions, or NULL (after printing an error) if the file is
+ *         corrupt.
+ */
+divisions_t* read_divisions_checked(void* input_map, const footer_t* footer,
+                                    long filesize) {
+   divisions_t* r;
+   long position;
+   uint64_t end;
+
+   if (validate_footer(footer, filesize) != 0)
+      return NULL;
+   end = (uint64_t)filesize - sizeof(footer_t);
+   position = (long)footer->divisions_t_pos;
+
+   r = calloc(1, sizeof(divisions_t));
+   if (r == NULL)
+      return NULL;
+   r->divisions = calloc((size_t)footer->n_divisions, sizeof(division_t*));
+   if (r->divisions == NULL) {
+      free(r);
+      return NULL;
+   }
+   r->n_divisions = footer->n_divisions;
+
+   for (int i = 0; i < footer->n_divisions; i++) {
+      r->divisions[i] = read_division_checked(input_map, &position, end);
+      if (r->divisions[i] == NULL)
+         goto corrupt;
+   }
+   if ((uint64_t)position != end)
+      goto corrupt;
+   return r;
+
+corrupt:
+   error("Corrupt .msz: the division table does not match the footer (file "
+         "size %ld, divisions at %llu). The file is likely truncated, "
+         "overwritten or was written by concurrent processes; re-create it "
+         "from the source data.\n",
+         filesize, (unsigned long long)footer->divisions_t_pos);
+   dealloc_read_divisions(r);
+   return NULL;
+}
+
+/**
  * @brief Parses the MSZ file footer and reconstructs block length queues and divisions.
  * @param footer Output pointer set to the parsed footer_t.
  * @param input_map Pointer to the memory-mapped MSZ file.
@@ -2734,6 +2909,18 @@ int parse_footer(footer_t** footer, void* input_map, long input_filesize,
    print("\tEOF position: %ld\n", input_filesize);
    print("\tOriginal filesize: %ld\n", (*footer)->original_filesize);
 
+   *xml_block_lens = NULL;
+   *mz_binary_block_lens = NULL;
+   *inten_binary_block_lens = NULL;
+   *n_divisions = 0;
+
+   /* Reject corrupt files before any offset is dereferenced. */
+   *divisions = read_divisions_checked(input_map, *footer, input_filesize);
+   if (*divisions == NULL) {
+      *footer = NULL;
+      return 1;
+   }
+
    *xml_block_lens = read_block_len_queue(input_map, (*footer)->xml_blk_pos,
                                           (*footer)->mz_binary_blk_pos);
    *mz_binary_block_lens =
@@ -2743,9 +2930,6 @@ int parse_footer(footer_t** footer, void* input_map, long input_filesize,
        input_map, (*footer)->inten_binary_blk_pos, (*footer)->divisions_t_pos);
 
    *n_divisions = (*footer)->n_divisions;
-
-   *divisions =
-       read_divisions(input_map, (*footer)->divisions_t_pos, *n_divisions);
 
    return 0;
 }

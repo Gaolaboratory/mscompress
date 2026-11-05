@@ -356,6 +356,15 @@ if(Python3_Interpreter_FOUND)
 else()
     message(STATUS "ExtractIndexTest skipped: no Python 3 interpreter found")
 endif()
+# Corrupt .msz inputs (bad/stale footer offsets, truncation) must fail with an
+# error and a non-zero exit code rather than crash.
+if(Python3_FOUND)
+    add_test(NAME CorruptMszTest
+        COMMAND ${Python3_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test_corrupt_msz.py
+                $<TARGET_FILE:mscompress> ${TEST_DATA_DIR}/test.msz
+                ${CMAKE_CURRENT_BINARY_DIR}/tmp_corrupt_msz
+    )
+endif()
 # --- byte shuffle -----------------------------------------------------------
 
 # A --shuffle file must decompress byte-identically, differ from the

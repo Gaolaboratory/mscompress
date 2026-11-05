@@ -694,6 +694,9 @@ void dealloc_read_division(division_t* div);
 void dealloc_read_divisions(divisions_t* divisions);
 size_t write_divisions(divisions_t* divisions, int fd);
 divisions_t* read_divisions(void* input_map, long position, int n_divisions);
+int validate_footer(const footer_t* footer, long filesize);
+divisions_t* read_divisions_checked(void* input_map, const footer_t* footer,
+                                    long filesize);
 division_t* flatten_divisions(divisions_t* divisions);
 divisions_t* create_divisions(division_t* div, long n_divisions);
 long determine_n_divisions(long filesize, long blocksize);
